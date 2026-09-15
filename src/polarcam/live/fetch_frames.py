@@ -4,7 +4,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from time import sleep, strftime
+from time import monotonic, sleep, strftime
 
 import numpy as np
 from PySide6.QtWidgets import QApplication
@@ -162,7 +162,11 @@ def fetch_frames(
     preview_path: Path | None = None,
     preview_every: int | None = None,
     subtract_background: bool = False,
+    frame_timeout_s: float = 5.0,
 ) -> tuple[Path, float | None, int, dict | None]:
+    frame_timeout_s = float(frame_timeout_s)
+    if not np.isfinite(frame_timeout_s) or frame_timeout_s <= 0.0:
+        raise ValueError("Frame timeout must be finite and > 0 seconds.")
     app = QApplication.instance() or QApplication([])
     controller = Controller()
     background_profile = None
@@ -180,6 +184,23 @@ def fetch_frames(
     max_raw_value: int | None = None
     capture_error: str | None = None
     dropped_first_frame = False
+    last_frame_at: float | None = None
+
+    def _on_error(message: str) -> None:
+        nonlocal capture_error, done
+        if capture_error is None:
+            capture_error = str(message)
+        done = True
+
+    def _check_capture_state() -> None:
+        nonlocal done
+        if capture_error is not None:
+            raise RuntimeError(capture_error)
+        if stop_flag is not None and stop_flag.exists():
+            done = True
+        if not done and last_frame_at is not None:
+            if monotonic() - last_frame_at >= frame_timeout_s:
+                raise RuntimeError(f"No camera frames received for {frame_timeout_s:g} seconds.")
 
     def _timing_matches(snapshot: dict | None) -> bool:
         if not isinstance(snapshot, dict):
@@ -229,32 +250,36 @@ def fetch_frames(
             return
 
     def _on_frame(arr_obj: object) -> None:
-        nonlocal done, first_frame_seen, max_raw_value, capture_error, dropped_first_frame
+        nonlocal done, first_frame_seen, max_raw_value, dropped_first_frame, last_frame_at
         if done:
             return
-        frame_native = np.asarray(arr_obj, copy=True)
-        if not dropped_first_frame:
-            dropped_first_frame = True
-            first_frame_seen = True
-            return
         try:
-            cur_max = int(np.max(frame_native))
-            max_raw_value = cur_max if max_raw_value is None else max(max_raw_value, cur_max)
-        except Exception:
-            pass
-        frame_native = _subtract_background(
-            frame_native,
-            profile=background_profile,
-            actual_roi=actual_roi,
-            requested_roi=roi,
-        )
-        frame_saved = _as_saved_frame(frame_native)
-        collected.append(frame_saved)
-        if preview_every_n is not None and (len(collected) % preview_every_n) == 0:
-            _write_preview(frame_saved)
-        first_frame_seen = True
-        if stop_after is not None and len(collected) >= stop_after:
-            done = True
+            frame_native = np.asarray(arr_obj, copy=True)
+            last_frame_at = monotonic()
+            if not dropped_first_frame:
+                dropped_first_frame = True
+                first_frame_seen = True
+                return
+            try:
+                cur_max = int(np.max(frame_native))
+                max_raw_value = cur_max if max_raw_value is None else max(max_raw_value, cur_max)
+            except Exception:
+                pass
+            frame_native = _subtract_background(
+                frame_native,
+                profile=background_profile,
+                actual_roi=actual_roi,
+                requested_roi=roi,
+            )
+            frame_saved = _as_saved_frame(frame_native)
+            collected.append(frame_saved)
+            if preview_every_n is not None and (len(collected) % preview_every_n) == 0:
+                _write_preview(frame_saved)
+            first_frame_seen = True
+            if stop_after is not None and len(collected) >= stop_after:
+                done = True
+        except Exception as exc:
+            _on_error(f"Frame processing failed: {exc}")
 
     def _on_timing(payload: object) -> None:
         nonlocal actual_fps, actual_timing
@@ -284,10 +309,12 @@ def fetch_frames(
             return
 
     try:
-        controller.open()
+        controller.cam.error.connect(_on_error)
         controller.cam.roi.connect(_on_roi)
         controller.cam.gains.connect(_on_gains)
         controller.cam.timing.connect(_on_timing)
+        controller.open()
+        _check_capture_state()
         if roi is None:
             controller.full_sensor()
         else:
@@ -319,12 +346,13 @@ def fetch_frames(
         # Give the controller a short chance to publish timing/gain snapshots, but
         # do not refuse capture if the camera reports a snapped/clamped value.
         # The saved JSON still records the actual timing so analysis can inspect it.
-        t_cfg = __import__("time").time()
-        while ((__import__("time").time() - t_cfg) < 0.75):
+        t_cfg = monotonic()
+        while not done and (monotonic() - t_cfg) < 0.75:
             app.processEvents()
-            sleep(0.005)
+            _check_capture_state()
             if actual_timing is not None or (exp_ms is None and fps is None):
                 break
+            sleep(0.005)
             try:
                 controller.refresh_timing()
             except Exception:
@@ -333,7 +361,10 @@ def fetch_frames(
                 controller.refresh_gains()
             except Exception:
                 pass
-        controller.start()
+        _check_capture_state()
+        if not done:
+            last_frame_at = monotonic()
+            controller.start()
         try:
             controller.refresh_timing()
         except Exception:
@@ -343,33 +374,39 @@ def fetch_frames(
         except Exception:
             pass
 
-        t0 = __import__("time").time()
-        while actual_roi is None and (__import__("time").time() - t0) < 0.5:
+        t0 = monotonic()
+        while not done and actual_roi is None and (monotonic() - t0) < 0.5:
             app.processEvents()
+            _check_capture_state()
             sleep(0.01)
 
         # Wait briefly for first frame, retry start once if needed.
-        t_first = __import__("time").time()
-        while not first_frame_seen and (__import__("time").time() - t_first) < 0.75:
+        t_first = monotonic()
+        while not done and not first_frame_seen and (monotonic() - t_first) < 0.75:
             app.processEvents()
+            _check_capture_state()
             sleep(0.002)
-        if not first_frame_seen:
+        if not done and not first_frame_seen:
             try:
                 controller.stop()
             except Exception:
                 pass
             controller.start()
-            t_retry = __import__("time").time()
-            while not first_frame_seen and (__import__("time").time() - t_retry) < 1.25:
+            t_retry = monotonic()
+            while not done and not first_frame_seen and (monotonic() - t_retry) < 1.25:
                 app.processEvents()
+                _check_capture_state()
                 sleep(0.002)
 
         while not done:
             app.processEvents()
+            _check_capture_state()
             sleep(0.002)
-            if stop_flag is not None and stop_flag.exists():
-                done = True
     finally:
+        try:
+            controller.cam.error.disconnect(_on_error)
+        except Exception:
+            pass
         try:
             controller.cam.frame.disconnect(_on_frame)
         except Exception:
@@ -445,6 +482,7 @@ def main() -> None:
     parser.add_argument("--preview-path", default=None, help="Path to write a single-frame preview .npy")
     parser.add_argument("--preview-every", type=int, default=None, help="Write preview every N frames")
     parser.add_argument("--subtract-background", action="store_true", help="Subtract stored background profile")
+    parser.add_argument("--frame-timeout", type=float, default=5.0, help="Maximum seconds without a camera frame (default: 5)")
     parser.add_argument("--json", action="store_true", help="Emit JSON with path and actual_fps")
     args = parser.parse_args()
 
@@ -463,6 +501,7 @@ def main() -> None:
         preview_path=Path(args.preview_path) if args.preview_path else None,
         preview_every=args.preview_every,
         subtract_background=bool(args.subtract_background),
+        frame_timeout_s=args.frame_timeout,
     )
     if args.json:
         print(json.dumps({

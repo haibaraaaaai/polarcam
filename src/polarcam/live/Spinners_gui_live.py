@@ -11,7 +11,7 @@ import queue
 import subprocess
 import sys
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import Optional
 
 import cv2
@@ -40,6 +40,7 @@ except Exception:  # pragma: no cover
 
 import Detection_alg_offline as detect_spinners
 from pol_reconstruction import make_qu_reconstructor
+from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
 
 
 def _append_timing_log(msg: str) -> None:
@@ -1285,7 +1286,9 @@ class BasicVideoPlayer:
             self._ui_call(self.bottom_var.set, "Fetch frames failed.")
         else:
             def _load_and_start():
-                self._close_video()
+                if not self._close_video():
+                    self._set_fetch_busy(False)
+                    return
                 if self._load_npy_source(str(saved_path)):
                     use_fps = actual_fps if actual_fps and actual_fps > 0.0 else fps
                     if use_fps and use_fps > 0.0:
@@ -1326,7 +1329,8 @@ class BasicVideoPlayer:
             return
 
         # Reset analysis state before fetching a fresh stack.
-        self._close_video()
+        if not self._close_video():
+            return
         self._set_fetch_busy(True)
         sound_meta = self._sound_metadata()
         t = threading.Thread(
@@ -1348,8 +1352,8 @@ class BasicVideoPlayer:
             self.bottom_var.set("No loaded file to close.")
             return
         loaded_name = Path(self.video_path).name if self.video_path else "loaded source"
-        self._close_video()
-        self.bottom_var.set(f"Closed {loaded_name}. File handle released.")
+        if self._close_video():
+            self.bottom_var.set(f"Closed {loaded_name}. File handle released.")
 
     def _on_flat_field_toggle(self) -> None:
         # Intensity manipulation is disabled; keep this forced off.
@@ -3128,41 +3132,7 @@ class BasicVideoPlayer:
         arr: np.ndarray,
         roi_meta: Optional[dict] = None,
     ) -> np.ndarray:
-        a = np.asarray(arr)
-        if getattr(a, "ndim", 0) < 3 or int(a.shape[0]) < 2:
-            return a
-        try:
-            marker = np.asarray(a[-1])
-        except Exception:
-            return a
-        if getattr(marker, "ndim", 0) != 2:
-            return a
-        try:
-            nz = np.argwhere(marker != 0)
-        except Exception:
-            return a
-        if nz.shape[0] != 1:
-            return a
-        my, mx = int(nz[0][0]), int(nz[0][1])
-        try:
-            mv = float(marker[my, mx])
-        except Exception:
-            return a
-        if mv != 1.0:
-            return a
-        try:
-            marker_sum = float(np.sum(marker, dtype=np.float64))
-        except Exception:
-            return a
-        if marker_sum != 1.0:
-            return a
-        if roi_meta is not None:
-            try:
-                roi_meta["phase_x"] = int(mx) % 2
-                roi_meta["phase_y"] = int(my) % 2
-            except Exception:
-                pass
-        return np.asarray(a[:-1])
+        return strip_phase_marker(np.asarray(arr), roi_meta=roi_meta)
 
     def _active_theta_medium_key(self) -> str:
         return "water"
@@ -6932,6 +6902,8 @@ class BasicVideoPlayer:
                 used = 0
                 if seed_kind == "list":
                     for t in range(seed_count):
+                        if self.stop_event.is_set():
+                            return
                         try:
                             self._append_xy_from_frame(gray_frames[t])
                         except Exception:
@@ -6940,6 +6912,8 @@ class BasicVideoPlayer:
                 else:
                     # NPY replay (first seed_count frames)
                     for t in range(seed_count):
+                        if self.stop_event.is_set():
+                            return
                         gray = _to_gray_u8(self.npy_frames[t])
                         if gray is None:
                             break
@@ -8228,7 +8202,8 @@ class BasicVideoPlayer:
         if not path:
             return
 
-        self._close_video()
+        if not self._close_video():
+            return
         if not self._load_source(path):
             return
 
@@ -8290,6 +8265,7 @@ class BasicVideoPlayer:
 
         try:
             arr = np.load(path, mmap_mode="r", allow_pickle=True)
+            metadata = read_recording_metadata(Path(path))
         except Exception as e:
             messagebox.showerror("Error", f"Could not load NPY: {e}")
             return False
@@ -8331,6 +8307,28 @@ class BasicVideoPlayer:
             frame_count = int(arr.shape[0])
             has_frames_dim = True
 
+        if has_frames_dim:
+            try:
+                arr = strip_phase_marker(arr, marker_appended=recording_phase_marker(metadata))
+            except ValueError as exc:
+                messagebox.showerror("Error", str(exc))
+                return False
+            frame_count = int(arr.shape[0])
+
+        fps = recording_fps(metadata)
+        if fps is None:
+            fps = simpledialog.askfloat(
+                "Recording frame rate",
+                f"No recorded FPS found for {Path(path).name}.\nEnter the acquisition FPS for the time and frequency axes:",
+                parent=self.root,
+                minvalue=1e-9,
+            )
+            if fps is None:
+                return False
+            if not np.isfinite(fps) or fps <= 0.0:
+                messagebox.showerror("Error", "Frame rate must be finite and > 0.")
+                return False
+
         gray0 = _to_gray_u8(frame0)
         if gray0 is None:
             messagebox.showerror("Error", "Could not convert first frame to grayscale.")
@@ -8343,7 +8341,7 @@ class BasicVideoPlayer:
         self.source_kind = "npy"
         self.video_path = path
         self.frame_count = frame_count
-        self.source_fps = 30.0
+        self.source_fps = float(fps)
 
         self._start_after_load(gray0)
         return True
@@ -8624,6 +8622,8 @@ class BasicVideoPlayer:
                         except Exception as e:
                             self._ui_call(self._show_error, "Spinner detect error", str(e))
                         else:
+                            if self.stop_event.is_set():
+                                return
                             h, w = gray.shape
                             m = int(self.EDGE_EXCLUDE_PX)
                             centers = [
@@ -8647,6 +8647,9 @@ class BasicVideoPlayer:
             # If recon dies, decoder may be blocked on a full queue; stop it and surface the error.
             self.stop_event.set()
             self._ui_call(self._show_error, "Analysis error", str(e))
+            return
+
+        if self.stop_event.is_set():
             return
 
         if (not self._st_popup_done) and (smap_frames_seen >= 2) and (min_x_raw is not None):
@@ -8707,30 +8710,34 @@ class BasicVideoPlayer:
         except queue.Empty:
             pass
 
-    def _stop_workers(self):
+    def _stop_workers(self) -> bool:
         self.stop_event.set()
         self.decode_done = True
 
-        if self.decode_thread and self.decode_thread.is_alive():
-            self.decode_thread.join(timeout=1.0)
+        workers = (self.decode_thread, self.recon_thread)
+        deadline = time.monotonic() + 1.0
+        for worker in workers:
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(worker is not None and worker.is_alive() for worker in workers):
+            return False
         self.decode_thread = None
-
-        if self.recon_thread and self.recon_thread.is_alive():
-            self.recon_thread.join(timeout=1.0)
         self.recon_thread = None
 
         self._clear_queue()
-        self.stop_event.clear()
+        return True
 
-    def _close_video(self):
+    def _close_video(self) -> bool:
+        if not self._stop_workers():
+            self.bottom_var.set("Previous analysis is still stopping. Please retry once it has finished.")
+            return False
+
         # New-source safety: drop all cached images/buffers so repeated opens don't slow down.
         self._clear_all_caches()
         self._show_finished(False)
         self._stop_spotrec_preview_loop()
 
         self._close_spot_playback()
-
-        self._stop_workers()
 
         if self.cap is not None:
             try:
@@ -8809,14 +8816,15 @@ class BasicVideoPlayer:
                     pass
             self._smap_overlay_after_id = None
             self._smap_overlay_pending = []
+        return True
 
     def on_close(self):
         self._stop_live_intensity_analysis()
         self._stop_live_feed()
         self._stop_spotrec()
         self._stop_spotrec_preview_loop()
-        self._close_video()
-        self.root.destroy()
+        if self._close_video():
+            self.root.destroy()
 
         
 if __name__ == "__main__":

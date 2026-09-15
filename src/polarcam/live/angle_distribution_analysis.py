@@ -23,6 +23,7 @@ except Exception:
 
 import Detection_alg_offline as detect_spinners
 from pol_reconstruction import make_qu_reconstructor
+from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
 
 try:
     from scipy.signal import welch as _welch  # type: ignore
@@ -1106,6 +1107,11 @@ class AngleDistributionApp:
             frame_count = int(arr.shape[0])
             has_frames_dim = True
 
+        if has_frames_dim:
+            metadata = read_recording_metadata(path)
+            arr = strip_phase_marker(arr, marker_appended=recording_phase_marker(metadata))
+            frame_count = int(arr.shape[0])
+
         gray0 = _to_gray_u8(frame0)
         if gray0 is None:
             raise RuntimeError("Could not convert first frame to grayscale.")
@@ -1429,28 +1435,7 @@ class AngleDistributionApp:
         return None
 
     def _fps_from_sidecar(self, path: Path) -> Optional[float]:
-        for obj in self._sidecar_json_objects(path):
-            f = self._extract_fps_from_obj(obj)
-            if f is not None:
-                return f
-        candidates = [path.with_suffix(".json"), path.parent / f"{path.stem}.json"]
-        stem = path.stem
-        if stem.startswith("spotrec_"):
-            ts = stem[len("spotrec_") :]
-            candidates.append(path.parent / f"spotrec_preview_{ts}.json")
-        seen = set()
-        for c in candidates:
-            key = str(c.resolve()) if c.exists() else str(c)
-            if key in seen:
-                continue
-            seen.add(key)
-            obj = self._read_json_if_exists(c)
-            if obj is None:
-                continue
-            f = self._extract_fps_from_obj(obj)
-            if f is not None:
-                return f
-        return None
+        return recording_fps(self._sidecar_json_objects(path))
 
     def _resolve_fps(self, path: Path, shape: tuple[int, int], inspection_hint: bool) -> float:
         mode = str(self._fps_mode_var.get() or "Auto").strip()
@@ -1461,16 +1446,15 @@ class AngleDistributionApp:
         if mode == "Manual":
             try:
                 f = float(self._fps_manual_var.get())
-                if f > 0.0:
+                if np.isfinite(f) and f > 0.0:
                     return f
             except Exception:
                 pass
+            raise RuntimeError("Manual FPS must be finite and > 0.")
         sidecar_fps = self._fps_from_sidecar(path)
         if sidecar_fps is not None:
             return float(sidecar_fps)
-        if inspection_hint or (self._inspection_crop_side(shape) is not None):
-            return 1600.0
-        return 77.0
+        raise RuntimeError(f"No recorded FPS found for {path.name}. Select 77, 1600, or Manual FPS.")
 
     def _current_fps(self) -> float:
         n = len(self._spot_fps)

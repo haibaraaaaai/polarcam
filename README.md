@@ -5,6 +5,18 @@ is Hugh Bowman's Polarcam Live implementation, imported from Polarcam_v3 as a
 baseline for further development. Its acquisition and analysis methods have not
 been rewritten in this import.
 
+## Rewrite Goal
+
+Performance comes before structural tidiness: minimize reliable camera ROI/FPS
+transition time and buffer save/drain time. The planned spot cycler will visit a
+selected list of spots, record approximately 10 seconds at high FPS at each ROI,
+then repeat the list. Switching and saving must not consume a large fraction of
+the acquisition time. Data integrity remains essential; the cycler is not yet
+implemented and hardware transition latency has not been measured here.
+
+See [REWRITE_NOTES.md](REWRITE_NOTES.md) for decisions, implemented fixes, deferred
+scientific questions, and the home/lab validation plan.
+
 ## Install and Run
 
 Use Python 3.12.10 or later with Tk support. From the repository root on Windows:
@@ -53,8 +65,18 @@ python src/polarcam/live/tdms_manual_scaling_xy_gui.py
 ```
 
 The TDMS utility retains an upstream machine-specific default input path; select
-your own file. Auxiliary scripts remain an imported baseline, not a portability
-or behavior cleanup.
+your own file. Most auxiliary behavior remains the imported baseline. Subsequent
+targeted changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+
+The live and angle-analysis NPY readers use recorded FPS from accompanying JSON
+metadata and exclude v3 phase-marker images from the measurement frames. For old
+recordings without recorded FPS, the live reader asks for it; the angle tool
+requires an explicit FPS selection instead of guessing from the image size.
+
+The capture helper fails on reported camera errors or a stalled frame stream.
+Its `--frame-timeout` option defaults to 5 seconds without a frame, not a delay
+between captures or a limit on recording duration. Increase it for intentionally
+slow acquisition. This does not bound a blocked native SDK call or disk write.
 
 ## Source Import and Attribution
 
@@ -66,7 +88,10 @@ Imported on 2026-09-15 from the local Polarcam_v3 checkout:
 - Scope: the 12 top-level Python scripts, three `backend/` Python files, and two
   `Controlling/controller/` Python files, 17 upstream files in total.
 - All 17 files were imported byte-for-byte. Only package markers, the external
-  launcher, dependency metadata, and documentation were added or adapted.
+  launcher, dependency metadata, and documentation were added or adapted at the
+  initial import, preserved in commit `bb47c6490379f4c8ae90cbfe6d3e4315dad2792c`.
+- The working source now includes targeted reliability fixes and a shared
+  recording-metadata helper; it is no longer byte-for-byte identical to v3.
 
 Hugh Bowman developed the v3 live application and analysis workflow, building on
 Daping Xu's earlier Polarcam camera software and rewrite. Upstream history also
@@ -104,7 +129,7 @@ has not been rewritten.
 
 ## Development Checks
 
-After installing the project, run the camera-free launcher tests:
+After installing the project, run the camera-free tests:
 
 ```powershell
 python -m unittest discover -s tests -v
@@ -112,5 +137,7 @@ python -m unittest discover -s tests -v
 
 The import was checked for matching source hashes and Python syntax. Launcher
 tests cover the selected interpreter, script layout, working directory, help, and
-exit status. These checks do not establish camera timing, hardware behavior, or
-scientific parity with the lab installation; those require separate validation.
+exit status. Regression tests use synthetic recordings and fake cameras to cover
+FPS/marker handling, capture errors and inactivity, and analysis-worker shutdown.
+These checks do not establish camera timing, hardware behavior, or scientific
+parity with the lab installation; those require separate validation.
