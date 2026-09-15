@@ -5,19 +5,22 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "polarcam"
 version = "0.0.1"
-description = "Minimal scaffold while rewriting"
+description = "Live polarization-camera acquisition and spot analysis"
 readme = "README.md"
 requires-python = ">=3.12.10"
 dependencies = [
-    "numpy",
-    "PySide6",
-    "scikit-image",
+    "numpy>=2.0,<3",
+    "opencv-python>=4.10,<5",
+    "Pillow",
     "scipy",
     "matplotlib",
+    "PySide6",
+    "npTDMS",
 ]
 
 # Optional, developer-focused tools
 [project.optional-dependencies]
+camera = ["ids-peak", "ids-peak-ipl"]
 dev = ["pyinstaller>=6.0", "black", "ruff", "mypy"]
 
 [tool.setuptools]
@@ -26,21 +29,11 @@ package-dir = { "" = "src" }
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["polarcam*"]
+namespaces = false
 
 # Ship common UI assets if you add them later (harmless if none exist)
 [tool.setuptools.package-data]
 "polarcam" = ["**/*.qss", "**/*.ico", "**/*.png"]
-
-# Archived pre-rewrite sources live under legacy/ for reference only and are
-# not maintained, so keep the dev tooling out of them.
-[tool.ruff]
-extend-exclude = ["legacy"]
-
-[tool.black]
-extend-exclude = "^/legacy/"
-
-[tool.mypy]
-exclude = "^legacy/"
 
 # CLI entry point (shows a console on Windows)
 [project.scripts]

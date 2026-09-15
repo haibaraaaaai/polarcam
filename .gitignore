@@ -1,13 +1,30 @@
 __pycache__/
+*.py[cod]
 *.egg-info/
 build/
 dist/
 .venv/
+venv/
+.mplconfig/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+_tmp/
 recordings/
 recordings_processed/
 captures/
 captures_processed/
 cycles/
+runs/
+datasets/
+backgrounds/
+frame_runs/
+spotrec_runs/
+varmap_runs/
+background_profile*.npy
+background_profile.json
+spot_analysis_timing.txt
+theta_r_curve_parameters/
 
 #temp for testing
 gradient_rods.avi

@@ -1,242 +1,116 @@
-# PolarCam (rewrite) — lab README
+*# Polarcam
 
+Live polarization-camera acquisition and spot analysis. The maintained application
+is Hugh Bowman's Polarcam Live implementation, imported from Polarcam_v3 as a
+baseline for further development. Its acquisition and analysis methods have not
+been rewritten in this import.
 
-## 0) TL;DR — run it
+## Install and Run
 
-```bash
-# 1) create & activate venv
+Use Python 3.12.10 or later with Tk support. From the repository root on Windows:
+
+```powershell
 python -m venv .venv
-. .venv/Scripts/Activate.ps1
-python -m pip install -U pip
-
-# 2) editable install
+.\.venv\Scripts\Activate.ps1
 python -m pip install -e .
-
-# 3) IDS SDK
-# Install the IDS peak Cockpit.
-# Then the Python wheels:
-python -m pip install --no-deps ids-peak ids-peak-ipl
-
-# 4) launch (choose one)
-polarcam          # console visible (logs)
-polarcam-gui      # no console window on Windows
-# or
-python -m polarcam.cli
+python -m polarcam --data-dir .\runs
 ```
 
-**First things to check in the UI**
+`polarcam` and `polarcam-gui` launch the same live application. The launcher starts
+the original script with the current Python interpreter, preserving its local
+imports and camera subprocess layout. `--help` does not open the GUI or camera.
 
-* **Exposure is in milliseconds**
-* **ROI**: "Full sensor" to set max ROI; then use small ROIs for speed.
-* **Gains**: hit **Refresh gains** to populate min/max if not already shown.
+`--data-dir` selects the working directory for recordings, backgrounds, and
+analysis output; it defaults to the current directory. Use a dedicated directory
+outside any known-working reference installation. This option is not a sandbox:
+file dialogs and explicitly selected output paths can still use other locations.
 
----
+Live capture additionally requires the IDS peak SDK and camera drivers. Install
+IDS peak Cockpit first, then install the Python camera bindings in this environment:
 
-## 1) What this app does today
-
-* Live preview of the polarization camera (12→8‑bit highlight LUT with floor/cap/gamma).
-* ROI + timing controls (FPS + **exposure in ms**), desaturate helper.
-* Analog/digital gains.
-* **Spot detection** on a given number of frames (DoG‑based, with two‑stage φ‑coverage / r‑uniformity classification).
-* **Spot viewer**: shows a zoomed crop with circular ROI mask, live 4‑channel anisotropy scatter plot, optional **recording at max camera FPS** (saves raw pixel `.npy` shards + JSON metadata with mosaic layout info).
-* **Manual add‑spot** with live preview circle (cyan dashed) shown before committing.
-* **Multi‑spot cycler/recorder**: hops a tight HW‑ROI around selected spots with configurable dwell time, records 4×pol mean signals per dwell to compressed `.npz` shards. Optional **raw pixel saving** (one uncompressed `.npz` + companion `.json` per spot per dwell with full mosaic layout metadata).
-* **Test (AVI)** button: loads an AVI file as a mock camera for offline testing.
-
-**Directory conventions**
-
-* Cycle outputs land in `./cycles/cycle_YYYYMMDD_HHMMSS/cycle_spotXX/…npz` (timestamped per run).
-* Spot viewer recordings land in `./captures/spotN_YYYYMMDD_HHMMSS/…npy` + `…_meta.json`.
-
----
-
-## 2) Typical workflows
-
-### A) Live + detect + view
-
-1. **Open → Start**.
-2. **Full sensor**, then tweak exposure/gains or run **Desaturate**.
-3. **Detect spots** (threshold mode: *absolute* DN or *percentile*; defaults are fine).
-4. Select one or more spots → **View spot…** (separate window with scatter plot). This pauses the main live preview while the viewer runs.
-
-   * **Start Rec @ max FPS** inside the viewer to save raw pixel crops to `.npy` shards + a `_meta.json` with crop position, channel layout, and ROI details.
-
-### B) Cycle multiple spots
-
-1. Detect/select spots (or add manually with cx/cy/r fields — preview circle shows before adding).
-2. Set **dwell time** (default 1.0 s), check **Save cycle data** and/or **Save raw pixels** as needed.
-3. Click **Start Cycle**.
-
-   * Worker reduces HW‑ROI around each spot aggressively (respecting IDS step/min limits).
-   * After each ROI change, worker calls **`set_timing(inf, None)`** to hit the maximum FPS permitted by ROI + exposure.
-   * Circular mask is applied — only pixels within the spot radius contribute to channel means.
-   * UI preview is throttled (≤20 Hz), while recording uses the max camera rate.
-4. Outputs go to `./cycles/cycle_spotXX/`:
-   * `*_sNN_cNNNN.npz` — per‑chunk 4‑channel mean signals (if "Save cycle data" is checked).
-   * `*_sNN_dNNNN_raw.npz` + `*_sNN_dNNNN_raw.json` — raw pixel stacks per dwell (if "Save raw pixels" is checked).
-
----
-
-## 3) Spot processing pipeline
-
-A spot is defined by `(cx, cy, r)` in full-sensor coordinates.  Three layers of cropping/masking happen:
-
-```
-Full sensor (2464 × 2056)
- └─ Hardware ROI (w, h, x, y) — set on camera, reduces bus bandwidth
-     └─ Software crop (even-sided square ≈ 2r + padding, centred on spot)
-         └─ Circular mask (radius r, centred on spot)
+```powershell
+python -m pip install -e ".[camera]"
 ```
 
-| Step | What happens | Who does it |
-|------|-------------|-------------|
-| **HW ROI** | Camera reads out only a rectangle around the spot. **Cycler & recorder** use `roi_for_spot(cx, cy, r)` (defaults: `margin=0, min_r=0`) → aggressive 256 px wide × ≈2r tall strip for max FPS. **Viewer** uses `roi_for_spot(…, margin=6, min_r=4)` → comfortable square ≈ 2·max(4,r)+12 on each side for a nicer preview. | Camera hardware |
-| **Software crop** | A smaller even-sided square is cut from the delivered frame, tightly fitting the spot diameter + a few pixels of padding. | Recorder / cycler `_on_frame` |
-| **Circular mask** | Inside the software crop, pixels outside the circle of radius `r` are either **zeroed** (recorder) or **excluded** from means (cycler / viewer scatter). | Recorder / cycler / viewer |
+The camera SDK is not needed to analyze saved AVI/NPY files. Runtime dependencies
+are declared in [pyproject.toml](pyproject.toml); [requirements.txt](requirements.txt)
+installs that same project. The original machine's package pins were not imported
+as a lockfile, and its Python environment has not been reproduced.
 
-### What each mode saves & computes
+## Application
 
-| | **Signal computation** | **Saved to disk** | **Masking in saved data** |
-|---|---|---|---|
-| **Spot viewer** (scatter) | 4-channel means from **masked** (circular) pixels only | *(delegates to recorder below)* | — |
-| **Spot recorder** (`.npy` shards) | None (saves raw) | Rectangular crop `(N, h, w)` uint16 | **Zeroed** outside circle |
-| **Cycler** (channel means `.npz`) | 4-channel means from **masked** (circular) pixels only | Float64 mean arrays per channel | N/A (already reduced) |
-| **Cycler raw** (`_raw.npz`) | *(same as above)* | Rectangular crop `(N, h, w)` uint16 | **Not masked** — full rectangle preserved |
+- Live camera preview, exposure/gain controls, and spot inspection.
+- AVI/NPY loading, spot detection, anisotropy reconstruction, and rotation analysis.
+- Spot recording through the bundled camera helper.
+- Standalone angle-distribution, TDMS, manual-rotation, and recording-comparison tools.
 
-The cycler keeps raw pixels unmasked intentionally: it's archival data that can be reprocessed with a different radius. The recorder zeros outside the circle because those shards are typically consumed directly and the zeros compress well.
+The original standalone scripts remain under [src/polarcam/live](src/polarcam/live).
+For example, from the repository root:
 
-### Reference pixel: `crop_top_left_sensor_yx`
-
-The saved metadata field `crop_top_left_sensor_yx = [y, x]` is the **absolute sensor coordinate of the top-left corner of the rectangular crop** — i.e. pixel `[0, 0]` of the saved array. It is the rectangle corner, *not* the first non-zero/masked pixel.
-
-To recover the mosaic channel of any pixel `[row, col]` in a saved crop:
-
-```python
-tl_y, tl_x = meta["crop_top_left_sensor_yx"]
-channel = MOSAIC_LAYOUT[((tl_y + row) % 2, (tl_x + col) % 2)]
+```powershell
+python src/polarcam/live/angle_distribution_analysis.py
+python src/polarcam/live/tdms_manual_scaling_xy_gui.py
 ```
 
----
+The TDMS utility retains an upstream machine-specific default input path; select
+your own file. Auxiliary scripts remain an imported baseline, not a portability
+or behavior cleanup.
 
-## 4) Data formats
+## Source Import and Attribution
 
-### Cycle `.npz` shards (channel means)
+Imported on 2026-09-15 from the local Polarcam_v3 checkout:
 
-Each file contains arrays: `t` (seconds from local `t0`), `c0`, `c45`, `c90`, `c135` (float64 per‑frame means), and a `meta` JSON blob (bytes) with:
+- Source revision: `5fe41d5bdd9f089a441f30554888c0b4773e62a7` (2026-09-10).
+- Source directory: `polarcam_live/`.
+- Destination: `src/polarcam/live/`, preserving relative paths.
+- Scope: the 12 top-level Python scripts, three `backend/` Python files, and two
+  `Controlling/controller/` Python files, 17 upstream files in total.
+- All 17 files were imported byte-for-byte. Only package markers, the external
+  launcher, dependency metadata, and documentation were added or adapted.
 
-* `spot = {cx, cy, r, label}`
-* `applied_roi = {x, y, w, h}` (HW‑ROI during dwell)
-* `crop_abs = {x, y, w, h}` (software crop used to compute means)
-* `t0_perf_counter`
+Hugh Bowman developed the v3 live application and analysis workflow, building on
+Daping Xu's earlier Polarcam camera software and rewrite. Upstream history also
+contains contributions recorded under the author name Hugh T. This is a source
+snapshot import, not a merge of the v3 commit history. Its source revision identifies
+the baseline in the retained local v3 repository.
 
-### Cycle raw pixel `.npz` + `.json` (per spot per dwell)
+The existing [LICENSE](LICENSE) is retained unchanged. The imported v3 checkout
+contained no top-level project license. Attribution here does not resolve the
+license for those contributions; confirm permission and applicable notices before
+redistributing the combined application. This import does not assign a new license
+to Hugh's contributions.
 
-The `.npz` contains `frames` `(N, h, w)` uint16 stack, `t` (relative timestamps), and `meta` (JSON as byte array). The companion `.json` has the same metadata in a human‑readable file:
+### Excluded From This Import
 
-* `spot = {cx, cy, r, label}`
-* `layout = {"(0,0)": "90", "(0,1)": "45", "(1,0)": "135", "(1,1)": "0"}`
-* `crop_top_left_sensor_yx = [y, x]` — position of the crop's top‑left pixel in full‑sensor coordinates
-* `crop_top_left_channel` — polarization angle of that top‑left pixel (e.g. `"90"`)
-* `applied_roi`, `crop_abs`, `t0_perf_counter`, `n_frames`, `n_discarded`
+- Calibration/theta-model assets, background profiles, recordings, and datasets.
+- Simulation/offline experiments and the dataset-specific analysis-script collection.
+- Virtual environments, Git metadata, build/distribution output, and generated plots.
+- V3's obsolete `src/polarcam` and `Polarcam_v3_Hugh` application copies.
 
-### Spot viewer `.npy` shards + `_meta.json`
+Missing calibration assets mean this is not an equivalent deployment of the lab
+installation: external theta models and background corrections require their
+corresponding files. No files were changed in the local v3 or Polarcam Software
+reference installations.
 
-`.npy` shards contain raw pixel crops `(chunk_len, h, w)` uint16. The `_meta.json` records:
+## Earlier Versions
 
-* `spot`, `layout`, `crop_top_left_sensor_yx`, `crop_top_left_channel`
-* `roi_hw_requested`, `crop_hw`, `crop_offset_in_roi`
+The superseded Qt application, 2024 legacy implementation, offline utilities and
+notebooks, reference files, and old rewrite roadmap are preserved in Git history
+at `6c36303084b4ff799a277166df016b8b62e9c53d`.
 
----
+These earlier materials have been removed from the current source tree so the
+rewrite starts with only the maintained v3 live baseline. Existing Git history
+has not been rewritten.
 
-## 5) Offline helpers
+## Development Checks
 
-### `offline/merge_recording.py`
+After installing the project, run the camera-free launcher tests:
 
-Merges chunked full‑frame `.npy` recordings into a single file.
-
-### `offline/merge_spot_capture.py`
-
-Merges spot‑viewer `.npy` shards for a given capture into a single contiguous array.
-
----
-
-## 6) Polarization mosaic layout
-
-The sensor uses a 2×2 super‑pixel layout indexed by `(row % 2, col % 2)`:
-
-| (row%2, col%2) | Angle |
-|---|---|
-| (0, 0) | 90° |
-| (0, 1) | 45° |
-| (1, 0) | 135° |
-| (1, 1) | 0° |
-
-All saved metadata references (`crop_top_left_channel`, `layout` dicts) follow this convention.
-
----
-
-## 7) Project structure
-
-```
-src/polarcam/
-├── __init__.py          # Package bootstrap, logging setup
-├── __main__.py          # python -m polarcam entry point
-├── cli.py               # QApplication launcher, arg parsing
-├── hardware.py          # Shared sensor constants, mosaic layout, snap helpers
-├── analysis/
-│   ├── detect.py        # DoG spot detection
-│   ├── pol_reconstruction.py  # (X,Y) anisotropy + (Q,U) reconstructors
-│   └── smap.py          # S-map accumulator (per-pixel min/max of Q/U)
-├── app/
-│   ├── main_window.py   # Main GUI window
-│   ├── lut_widget.py    # 12-bit highlight LUT widget
-│   ├── spot_detect.py   # Detection + classification orchestrator
-│   ├── spot_viewer.py   # Per-spot viewer with scatter plot + recorder
-│   ├── spot_cycler.py   # Multi-spot cycling recorder
-│   └── spot_recorder.py # Per-spot raw pixel shard recorder
-├── backend/
-│   ├── base.py          # Abstract camera interface (ICamera)
-│   ├── ids_backend.py   # IDS peak camera backend
-│   └── mock_backend.py  # AVI-based mock camera for testing
-├── capture/
-│   └── frame_writer.py  # Full-frame chunked writer with background I/O
-└── controller/
-    └── controller.py    # Thin controller over IDSCamera
+```powershell
+python -m unittest discover -s tests -v
 ```
 
----
-
-## 8) Known gotchas
-
-* **ROI snapping**: hardware enforces step/min/max; snapping to a spot can over/under cut it.
-* **Dwell/save settings are snapshot**: toggling checkboxes mid‑cycle has no effect; values are read when you click Start Cycle.
-* **Transition frames**: when the HW‑ROI hops between spots the first 2–3 frames may have the wrong crop dimensions. The cycler discards these automatically (reported as `n_discarded` in raw metadata).
-
----
-
-## 9) Notes
-
-* Alias guard: fps/4.
-* Hardware: Sensor 2464×2056, ROI width step 4, height step 2, min width 256, min height 2.
-* Polarization layout: `(0,0)=90°`, `(0,1)=45°`, `(1,0)=135°`, `(1,1)=0°`.
-
----
-
-## 10) History
-
-This repository started as a clean rewrite of
-[`haibaraaaaai/PolarCam`](https://github.com/haibaraaaaai/PolarCam), originally
-as a separate repo rather than a branch. The pre‑rewrite history has since been
-merged back in, so `git log` here contains the commits of **both** projects.
-
-* The old project's files were moved under `legacy/` before merging, so nothing
-  in `src/polarcam/`, `offline/` or `reference_files/` was touched and every
-  pre‑existing commit SHA in this repo is unchanged.
-* `git log --graph` therefore shows more than one root commit — that is
-  expected, not corruption.
-* `git log -- legacy/<path>` and `git blame legacy/<path>` still resolve to the
-  original authors and dates.
-
-`legacy/` is kept for reference only; it is not part of the installable
-package and is not maintained. Deleting it in a future commit would not lose
-any history.
+The import was checked for matching source hashes and Python syntax. Launcher
+tests cover the selected interpreter, script layout, working directory, help, and
+exit status. These checks do not establish camera timing, hardware behavior, or
+scientific parity with the lab installation; those require separate validation.
