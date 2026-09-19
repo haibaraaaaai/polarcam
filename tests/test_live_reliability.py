@@ -18,6 +18,78 @@ with patch.object(sys, "path", [str(LIVE_DIR), *sys.path]):
     from polarcam.live import Spinners_gui_live as live_gui
 
 
+class ChannelConventionTests(unittest.TestCase):
+    def setUp(self):
+        self.frame = np.tile(np.array([[10, 70], [30, 90]], dtype=np.uint16), (4, 4))
+        self.expected = (0.8, 0.4, 0.5 * np.arctan2(0.4, 0.8))
+        self.player = live_gui.BasicVideoPlayer.__new__(live_gui.BasicVideoPlayer)
+        self.angle_app = angle_distribution_analysis.AngleDistributionApp.__new__(
+            angle_distribution_analysis.AngleDistributionApp
+        )
+
+    def test_angle_bounds_agree_with_sensor_and_live(self):
+        result = self.angle_app._xy_phi_from_gray_bounds(self.frame, (0, 4, 0, 4))
+        np.testing.assert_allclose(result, self.expected, atol=1e-6)
+        live_result = self.player._xy_phi_stats_from_raw_window(self.frame)
+        np.testing.assert_allclose(result, live_result[:3], atol=1e-6)
+
+    def test_angle_append_uses_sensor_convention(self):
+        self.angle_app._spot_bounds_int_all = [(0, 4, 0, 4)]
+        self.angle_app._spot_xy_series_all = [[]]
+        self.angle_app._spot_phi_series_all = [[]]
+        self.angle_app._append_xy_from_frame(self.frame)
+        result = (*self.angle_app._spot_xy_series_all[0][0], self.angle_app._spot_phi_series_all[0][0])
+        np.testing.assert_allclose(result, self.expected, atol=1e-6)
+
+    def test_auto_capture_uses_sensor_convention_for_all_roi_parities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            path = out_dir / "capture.npy"
+            self.player._spotrec_save_dir = Mock(return_value=out_dir)
+            sensor = np.tile(np.array([[10, 70], [30, 90]], dtype=np.uint16), (5, 5))
+            for offset_y in (0, 1):
+                for offset_x in (0, 1):
+                    with self.subTest(offset_x=offset_x, offset_y=offset_y):
+                        frame = sensor[offset_y:offset_y + 8, offset_x:offset_x + 8]
+                        marker = np.zeros_like(frame)
+                        marker[offset_y, offset_x] = 1
+                        np.save(path, np.stack([frame, marker]))
+                        process = Mock(returncode=0)
+                        process.communicate.return_value = (json.dumps({
+                            "path": str(path), "actual_fps": 1600.0,
+                            "roi": {"OffsetX": offset_x, "OffsetY": offset_y, "Width": 8, "Height": 8},
+                        }), "")
+                        with patch.object(live_gui.subprocess, "Popen", return_value=process):
+                            xy, phi, fps, count = self.player._capture_auto_spot_series(
+                                center=(4.0, 4.0), n_frames=1, roi_raw=8, exp_ms=None
+                            )
+                        self.assertEqual(count, 1)
+                        self.assertEqual(fps, 1600.0)
+                        np.testing.assert_allclose((*xy[0], phi[0]), self.expected, atol=1e-6)
+
+    def test_playback_signed_channels_and_energy(self):
+        self.player._spot_window_size = 5
+        self.player.S_MAP_SMOOTH_K = 3
+        with patch.object(live_gui.cv2, "boxFilter", wraps=live_gui.cv2.boxFilter) as smooth:
+            with patch.object(live_gui.detect_spinners, "to_u8_preview", wraps=live_gui.detect_spinners.to_u8_preview) as preview:
+                self.player._spot_playback_windows(self.frame, 4.0, 4.0)
+        self.assertEqual(smooth.call_count, 2)
+        np.testing.assert_array_equal(smooth.call_args_list[0].args[0], 80.0)
+        np.testing.assert_array_equal(smooth.call_args_list[1].args[0], 40.0)
+        np.testing.assert_array_equal(preview.call_args.args[0], 8000.0)
+
+
+class PreviewBrightnessTests(unittest.TestCase):
+    def test_spot_preview_stretches_nonzero_values_without_mutating_input(self):
+        frame = np.array([[0, 10, 20], [30, 40, 50]], dtype=np.uint16)
+        original = frame.copy()
+        preview = live_gui.detect_spinners.to_u8_preview(frame, lo_pct=0.0, hi_pct=99.5)
+        np.testing.assert_array_equal(preview, [[0, 0, 64], [128, 192, 255]])
+        brighter_preview = live_gui.detect_spinners.to_u8_preview(frame * 4, lo_pct=0.0, hi_pct=99.5)
+        np.testing.assert_array_equal(brighter_preview, preview)
+        np.testing.assert_array_equal(frame, original)
+
+
 class SignalStub:
     def __init__(self):
         self.callbacks = []
@@ -108,8 +180,12 @@ class CaptureReliabilityTests(unittest.TestCase):
 
     def test_success_preserves_depth_marker_and_actual_fps(self):
         self.frames.extend(np.full((8, 8), value, dtype=np.uint16) for value in (999, 1000, 1001))
-        path, actual_fps, count, metadata = self.capture(fps=1600.0)
+        preview_path = Path(self.directory.name) / "preview.npy"
+        path, actual_fps, count, metadata = self.capture(fps=1600.0, preview_path=preview_path, preview_every=1)
         stack = np.load(path, allow_pickle=False)
+        preview = np.load(preview_path, allow_pickle=False)
+        self.assertEqual(preview.dtype, np.uint16)
+        np.testing.assert_array_equal(preview, np.full((8, 8), 1001, dtype=np.uint16))
         self.assertEqual(stack.dtype, np.uint16)
         self.assertEqual(stack.shape, (3, 8, 8))
         np.testing.assert_array_equal(stack[:, 0, 0], [1000, 1001, 1])

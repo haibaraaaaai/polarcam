@@ -1998,10 +1998,10 @@ class AngleDistributionApp:
         return (x0, x1, y0, y1)
 
     def _xy_phi_from_gray_bounds(self, gray: np.ndarray, bounds: tuple[int, int, int, int]) -> tuple[float, float, float]:
-        I0 = gray[0::2, 0::2]
+        I90 = gray[0::2, 0::2]
         I45 = gray[0::2, 1::2]
         I135 = gray[1::2, 0::2]
-        I90 = gray[1::2, 1::2]
+        I0 = gray[1::2, 1::2]
         x0, x1, y0, y1 = bounds
         a0 = I0[y0:y1, x0:x1]
         a90 = I90[y0:y1, x0:x1]
@@ -2222,10 +2222,10 @@ class AngleDistributionApp:
         self._spot_bounds_int_all = bounds
 
     def _append_xy_from_frame(self, gray: np.ndarray) -> None:
-        I0 = gray[0::2, 0::2]
+        I90 = gray[0::2, 0::2]
         I45 = gray[0::2, 1::2]
         I135 = gray[1::2, 0::2]
-        I90 = gray[1::2, 1::2]
+        I0 = gray[1::2, 1::2]
         eps = 1e-6
         for i, (x0, x1, y0, y1) in enumerate(self._spot_bounds_int_all):
             a0 = I0[y0:y1, x0:x1]

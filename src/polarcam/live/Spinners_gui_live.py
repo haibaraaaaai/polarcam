@@ -6622,10 +6622,10 @@ class BasicVideoPlayer:
             g = arr[i]
             if g.ndim != 2:
                 g = g[..., 0]
-            I0 = g[py::2, px::2]
+            I90 = g[py::2, px::2]
             I45 = g[py::2, (1 - px) :: 2]
             I135 = g[(1 - py) :: 2, px::2]
-            I90 = g[(1 - py) :: 2, (1 - px) :: 2]
+            I0 = g[(1 - py) :: 2, (1 - px) :: 2]
 
             ih, iw = I0.shape
             if ih <= 0 or iw <= 0:
@@ -7904,10 +7904,10 @@ class BasicVideoPlayer:
         raw_win = self._extract_window(gray, cx, cy, win).astype(np.uint8, copy=False)
 
         # Intensity-plane computations (half-res), then expand back to full-res.
-        I0 = gray[0::2, 0::2]
+        I90 = gray[0::2, 0::2]
         I45 = gray[0::2, 1::2]
         I135 = gray[1::2, 0::2]
-        I90 = gray[1::2, 1::2]
+        I0 = gray[1::2, 1::2]
 
         ix = int(round(cx / 2.0))
         iy = int(round(cy / 2.0))

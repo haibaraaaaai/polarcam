@@ -17,6 +17,9 @@ All notable changes to this project will be documented in this file.
   excluded from this import.
 
 ### Fixed
+- Correct inverted I0/I90 assignments in live auto-inspection, diagnostic spot
+  playback, and both angle-analysis reducers to Hugh's confirmed `[90,45;135,0]`
+  sensor convention. Saved raw recordings are unchanged.
 - Use recorded FPS and exclude phase-marker frames when reopening NPY recordings
   in the live and angle-analysis tools. Require explicit FPS when it is unknown.
 - Propagate camera errors and time out stalled frame streams in the capture
@@ -25,6 +28,8 @@ All notable changes to this project will be documented in this file.
   refuse source replacement or GUI destruction while analysis is still stopping.
 
 ### Added
+- Channel-convention regression tests and spot-preview contrast characterization;
+  verify native preview-file values and document existing display stretching.
 - Camera-free regression tests for recording reload, capture failure handling,
   inactivity deadlines, and worker shutdown.
 - `REWRITE_NOTES.md` documenting the performance-first spot-cycler goal, channel

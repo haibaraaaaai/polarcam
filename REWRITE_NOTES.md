@@ -16,6 +16,29 @@ defeat the purpose. The spot cycler is a new feature, not implemented in v3.
 
 No hardware transition benchmark or cycler implementation was made in this step.
 
+## Update: 2026-09-19
+
+- The user checked with Hugh: the correct sensor convention is `[90,45;135,0]`;
+  the inverted I0/I90 assignments were errors, not an intentional convention.
+- Corrected the four identified mappings: live `_capture_auto_spot_series`, live
+  `_spot_playback_windows`, and angle-analysis `_xy_phi_from_gray_bounds` and
+  `_append_xy_from_frame`. Normal live reduction and shared reconstruction were
+  already correct and are unchanged. Existing saved data is not rewritten.
+- Added four channel regression tests, including mocked capture with all four
+  ROI parities and signed playback differences before squaring. Added one preview
+  contrast characterization test and extended the recorder test to verify native
+  preview-file values. All 33 camera-free tests pass (29 live plus four launcher).
+- Installed missing declared OpenCV and npTDMS dependencies with the editable
+  project install in this checkout's `.venv`; the earlier lab environment did not
+  travel with Git. Validation used this checkout's Python 3.12 environment.
+- The user reported unusually bright selected-spot displays during a lab test.
+  Source tracing and a synthetic example confirm automatic preview stretching;
+  see the brightness section below. No experimental recording was supplied for
+  inspection. Brightness behavior was investigated, not changed.
+- Global ROI parity in `_xy_phi_stats_from_frame`, other standalone readers,
+  intensity conversion, calibration, angular calculations, and camera performance
+  remain separate follow-ups. No cycler or backend changes were made.
+
 ## Handoff: 2026-09-15
 
 - Working branch: `testing/v3-rewrite`.
@@ -33,7 +56,7 @@ No hardware transition benchmark or cycler implementation was made in this step.
 
 | Review Finding | Decision / Status |
 | --- | --- |
-| 1. Inconsistent channel conventions | Explain and ask Hugh; calculations unchanged. |
+| 1. Inconsistent channel conventions | Resolved with Hugh and four inverted mappings corrected on 2026-09-19; global ROI parity remains a follow-up. |
 | 2. Recording reload loses FPS / includes marker | Fixed in the main live and angle-analysis NPY readers. |
 | 3. Frame-dependent intensity downscaling | Deferred at the user's request; explanation below. |
 | 4. Missing theta assets / silent model fallback | Deferred; inspect the local calibration assets later. |
@@ -116,22 +139,23 @@ goal: fast, reliable camera ROI/FPS changes and buffer saving for a future spot
 cycler that records about 10 seconds per selected spot and repeats the list.
 Do not restructure for its own sake, and do not sacrifice recording integrity.
 
-Findings 2, 6, and 7 have targeted fixes and camera-free regression tests. Channel
-conventions (1) await clarification from Hugh; intensity scaling (3), calibration
-assets (4), and angular calculations (5) are explicitly deferred. Do not change
-those or start the cycler automatically. No hardware performance is validated yet.
+Findings 1, 2, 6, and 7 have targeted fixes and camera-free regression tests. Hugh
+confirmed [90,45;135,0]; the four inverted channel mappings are corrected. Global
+ROI parity remains a follow-up. Intensity scaling (3), calibration assets (4), and
+angular calculations (5) are deferred. Spot-preview brightness scaling has been
+investigated but not changed. Do not change these or start the cycler automatically.
+No hardware performance is validated yet.
 
 Check the branch/worktree and the repository-local Python environment, then give
-a brief status based on the notes. Ask whether I have Hugh's reply, sample data,
-or a chosen next issue before continuing the deferred work. Keep decisions,
+a brief status based on the notes. Ask whether I have sample data or a chosen
+next issue before continuing the deferred work. Keep decisions,
 evidence, tests, and open questions in REWRITE_NOTES.md as we proceed.
 ```
 
 ### Questions To Take To Hugh
 
-1. For raw frames with the sensor grid `[90,45;135,0]`, why do angle analysis and
-   live auto-inspection use `[0,45;135,90]` while normal live analysis does not?
-   Is the sign difference intentional for older data or a coordinate convention?
+1. Resolved 2026-09-19: Hugh confirmed `[90,45;135,0]`. The swapped I0/I90
+  assignments were errors and the four identified paths have been corrected.
 2. What is the physical zero-angle reference and positive rotation direction?
    Are any saved recordings flipped, transposed, rotated, or shifted by an odd
    sensor ROI origin? Which path should serve as the reference for each format?
@@ -160,7 +184,7 @@ The detailed function map and numerical examples below support these questions.
 
 ### Next-Session Checklist
 
-- [ ] Receive Hugh's channel-convention explanation and record the decision.
+- [x] Receive Hugh's channel-convention explanation and record the decision.
 - [ ] Inspect a supplied old recording and its metadata without modifying it.
 - [ ] Agree expected results from physics/simulation rather than treating every
   existing output as correct.
@@ -221,9 +245,9 @@ reconstruction skips its final analysis stage and can stop while seeding traces.
 This is a bounded defensive fix, not a general asynchronous job scheduler. It does
 not claim cancellation support for every auxiliary worker or camera subprocess.
 
-## Channel Conventions: Question For Hugh
+## Channel Conventions: Confirmed By Hugh
 
-The user's stated sensor mosaic is:
+Hugh confirmed this sensor mosaic on 2026-09-19, as relayed by the user:
 
 ```text
 90   45
@@ -244,10 +268,10 @@ matters: a crop starting on an odd sensor row/column has a shifted mosaic.
 | Implementation | Effective Grid At Even Origin | Purpose / Callers |
 | --- | --- | --- |
 | Live `BasicVideoPlayer._xy_phi_stats_from_raw_window` | `[90,45;135,0]` | Normal live/spot/stationary XY and phi. Used by `_append_xy_frame`, `_append_xy_from_frame`, and the window wrapper `_xy_phi_stats_from_frame`. |
-| Live `_capture_auto_spot_series` | `[0,45;135,90]` | Fresh high-FPS captures for optional automatic inspection of the top spots; results override their plotted trajectories. |
-| Live `_spot_playback_windows` | `[0,45;135,90]` | Diagnostic S-space playback; computes squared energy, not signed phi. |
-| Angle `AngleDistributionApp._xy_phi_from_gray_bounds` | `[0,45;135,90]` | Batch inspection-file XY/phi through `_analyze_inspection_path`. |
-| Angle `_append_xy_from_frame` | `[0,45;135,90]` | XY/phi for single-file inspection and detected widefield spots in `_process_npy_worker`. |
+| Live `_capture_auto_spot_series` | `[90,45;135,0]` (corrected) | Fresh high-FPS captures for optional automatic inspection of the top spots; results override their plotted trajectories. |
+| Live `_spot_playback_windows` | `[90,45;135,0]` (corrected) | Diagnostic S-space playback; computes squared energy, not signed phi. |
+| Angle `AngleDistributionApp._xy_phi_from_gray_bounds` | `[90,45;135,0]` (corrected) | Batch inspection-file XY/phi through `_analyze_inspection_path`. |
+| Angle `_append_xy_from_frame` | `[90,45;135,0]` (corrected) | XY/phi for single-file inspection and detected widefield spots in `_process_npy_worker`. |
 | Shared `make_qu_reconstructor` | `[90,45;135,0]` at even origin | Raw Q/U on the overlapping intersection grid, used for S-map detection in both applications. |
 
 Source locations:
@@ -260,18 +284,50 @@ Therefore phi becomes `90 degrees - phi`, modulo 180 degrees. It reflects the
 angle; it is not merely a constant offset, and it reverses signed rotation.
 The radius and squared S-map energy can look unchanged, hiding the disagreement.
 
-Verified synthetic example: repeat the raw block `[10,70;30,90]`. Normal live
-reduction gives X=0.8, Y=0.4, phi=13.282526 degrees. Angle analysis gives X=-0.8,
-Y=0.4, phi=76.717474 degrees. The shared XY reconstructor agrees with normal live.
-
-Ask Hugh: "For the camera grid [90,45;135,0], was the inverted X convention in
-angle analysis and auto-inspection intentional, perhaps for older recordings or
-an image-axis convention? Should these paths agree with normal live analysis?"
+Verified synthetic example: repeat the raw block `[10,70;30,90]`. Normal live,
+corrected angle analysis, and corrected auto-capture now give X=0.8, Y=0.4,
+phi=13.282526 degrees. Before the fix, the latter paths gave X=-0.8, Y=0.4,
+phi=76.717474 degrees. The shared XY reconstructor agrees with normal live.
+Playback's signed X changes from -80 to +80; Y remains +40 and squared energy
+remains 8000. Previously exported angles are not automatically corrected;
+reanalysis of raw recordings uses the corrected convention.
 
 Additional point-1 follow-up: `_xy_phi_stats_from_frame` receives ROI metadata but
 passes only its local crop origin to the channel reducer. The parity of the global
 ROI origin is not applied there. GUI ROI requests are made even, but arbitrary
 older ROI recordings and actual camera readback still need a defined policy.
+
+## Selected-Spot Brightness: Investigated 2026-09-19
+
+- `_spotrec_update_preview` in the live GUI always calls `to_u8_preview(window,
+  lo_pct=0.0, hi_pct=99.5)`. This applies before and during "Spot examine"
+  recording and is independent of the live "Display stretch" checkbox.
+- `Detection_alg_offline.to_u8_preview` computes percentiles over nonzero pixels
+  in the current window, maps the lower/upper values to 0/255, and clips. Exact
+  zeros remain black. This is relative contrast, not absolute sensor brightness.
+  The scale can change as the crop, frame, or recording mode changes.
+- Verified example: `[0,10,20;30,40,50]` becomes `[0,0,64;128,192,255]` at those
+  percentiles. Multiplying all input values by four produces the same preview.
+  The helper does not modify the input array.
+- `_update_spot_view` and `_update_stationary_view` also stretch their windows
+  (0th/100th percentiles), but those thumbnails show the S-map, not raw intensity.
+- The live magnifier instead uses `_apply_live_display_stretch`, optional and
+  disabled by default, with user-selected low/high bounds. The spot-recording
+  preview's automatic scaling is not disabled by that control.
+- During recording, `_spotrec_preview_tick` first applies `_to_gray_u8` to the
+  preview file. Its frame-maximum-dependent conversion is the separate deferred
+  point 3 below, and remains unchanged.
+- `fetch_frames` saves native uint8/uint16 values to the recording and preview
+  NPY files; contrast scaling happens after loading the preview in the GUI.
+  Optional background subtraction does change saved values when enabled, and
+  recording exposure/gain settings affect the acquired signal. The Save action
+  copies the recording, not the rendered preview. Synthetic tests verify native
+  save/preview preservation; today's experimental values have not been checked.
+
+Recommendation for a later authorized display change: offer a fixed sensor-range
+preview alongside optional auto-contrast, so brightness is comparable across spots
+and recording states. Do not infer saturation or absolute brightness from the
+current stretched preview. No display or intensity-scaling change was made here.
 
 ## Intensity Scaling: Deferred Point 3
 
@@ -353,8 +409,9 @@ resolve intended conventions and model assumptions, rather than treating every
 current result as ground truth. Real SDK/hardware testing is still needed for
 switch latency, frame loss, buffer reuse, and recording throughput.
 
-Current automated checks: 24 reliability tests plus four launcher tests, run with
-the repository-local virtual environment (Python 3.13.0 on this machine):
+Current automated checks: 29 live tests plus four launcher tests, run with the
+repository-local virtual environment (Python 3.12 on the 2026-09-19 checkout;
+the original lab checks used Python 3.13.0):
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -366,6 +423,6 @@ science or hardware performance. Existing Pylance warnings in angle analysis for
 two script-local imports and the optional `Image.Image` annotation remain outside
 this change; runtime script imports and the new helper pass the tests.
 
-Next discussion: settle point 1 with Hugh, then choose the next numerical issue
-or begin the measured persistent-camera/segment-writer work. Keep this file
+Next discussion: choose whether to change spot-preview brightness presentation,
+address a deferred numerical issue, or begin the measured persistent-camera/segment-writer work. Keep this file
 updated when decisions change so home and lab work share the same assumptions.
