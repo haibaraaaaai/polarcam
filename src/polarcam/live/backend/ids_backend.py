@@ -9,7 +9,7 @@ import math
 import logging
 from dataclasses import dataclass
 from threading import Event, Lock
-from time import sleep
+from time import perf_counter, sleep
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -51,6 +51,7 @@ class _StreamWorker(QObject):
     stopped = Signal()
     closed = Signal()
     frame = Signal(object)   # numpy array (H,W) uint16 0..4095
+    frame_timed = Signal(object, float)
     error = Signal(str)
     roi = Signal(dict)       # {Width, Height, OffsetX, OffsetY}
     timing = Signal(dict)    # {fps, resulting_fps, exposure_us, ...}
@@ -868,6 +869,7 @@ class _StreamWorker(QObject):
                 buf = None
                 try:
                     buf = self._ds.WaitForFinishedBuffer(10)  # ms
+                    received_at = perf_counter()
                 except Exception:
                     continue
 
@@ -896,6 +898,7 @@ class _StreamWorker(QObject):
                         arr = arr.astype(np.uint16, copy=False)
 
                     self.frame.emit(arr)  # 0..4095 expected
+                    self.frame_timed.emit(arr, received_at)
                 except Exception as e:
                     self.error.emit(f"Convert failed: {e}")
                 finally:
@@ -1262,7 +1265,7 @@ class IDSCamera(ICamera):
             self._worker.stopped.connect(self._on_stopped, Qt.QueuedConnection)
             self._worker.closed.connect(self.closed, Qt.QueuedConnection)
 
-            self._worker.frame.connect(self.frame, Qt.QueuedConnection)
+            self._worker.frame_timed.connect(self._publish_frame, Qt.QueuedConnection)
             self._worker.error.connect(self.error, Qt.QueuedConnection)
             self._worker.roi.connect(self.roi, Qt.QueuedConnection)
             self._worker.timing.connect(self.timing, Qt.QueuedConnection)
@@ -1296,6 +1299,11 @@ class IDSCamera(ICamera):
             self.error.emit(f"Failed to open device: {e}")
             log.exception("open() failed")
             self._cleanup_all()
+
+    @Slot(object, float)
+    def _publish_frame(self, frame: object, received_at: float) -> None:
+        self.frame.emit(frame)
+        self.frame_timed.emit(frame, received_at)
 
     @Slot()
     def start(self) -> None:

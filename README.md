@@ -19,6 +19,12 @@ scientific questions, and the home/lab validation plan.
 
 ## Install and Run
 
+For desktop launch, machine setup, and the staged lab acceptance checklist, see
+[LAB_SETUP.md](LAB_SETUP.md). [Launch-Polarcam.cmd](Launch-Polarcam.cmd) opens the
+application with this checkout's `.venv`; run
+[Install-DesktopShortcut.ps1](Install-DesktopShortcut.ps1) to create **Polarcam Lab**
+on the Windows desktop. Its default data directory is this repository's `runs/`.
+
 Use Python 3.12.10 or later with Tk support. From the repository root on Windows:
 
 ```powershell

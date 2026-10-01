@@ -41,6 +41,8 @@ except Exception:  # pragma: no cover
 import Detection_alg_offline as detect_spinners
 from pol_reconstruction import make_qu_reconstructor
 from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
+from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope
+from polarcam.live import intensity_spots
 
 
 def _append_timing_log(msg: str) -> None:
@@ -316,23 +318,23 @@ class BasicVideoPlayer:
     STATIONARY_SEED_MIN_AREA = 2
     STATIONARY_MAX_CANDIDATES = 300
     STATIONARY_REC_77_FPS_DEFAULT = 77.0
-    STATIONARY_REC_77_EXP_MS_DEFAULT = 0.6
+    STATIONARY_REC_77_EXP_MS_DEFAULT = 1.2
     STATIONARY_REC_77_DURATION_S_DEFAULT = 5.0
     STATIONARY_REC_77_ROI_RAW_DEFAULT = 14
-    STATIONARY_REC_MAX_EXP_MS_DEFAULT = 0.6
+    STATIONARY_REC_MAX_EXP_MS_DEFAULT = 1.2
     STATIONARY_REC_MAX_DURATION_S_DEFAULT = 1.0
     STATIONARY_REC_MAX_FPS_EST_DEFAULT = 1640.0
     STATIONARY_REC_GAIN_DEFAULT = 1.0
     STATIONARY_REC_MAX_ROI_RAW = 14
     STATIONARY_REC_ALL_77_FPS = 77.0
-    STATIONARY_REC_ALL_77_EXP_MS = 0.6
+    STATIONARY_REC_ALL_77_EXP_MS = 1.2
     STATIONARY_REC_ALL_77_DURATION_S = 5.0
     STATIONARY_REC_ALL_77_ROI_RAW = 14
-    STATIONARY_REC_ALL_MAX_EXP_MS = 0.6
+    STATIONARY_REC_ALL_MAX_EXP_MS = 1.2
     STATIONARY_REC_ALL_MAX_DURATION_S = 1.0
     STATIONARY_REC_ALL_GAIN = 1.0
     STATIONARY_REC_ALL_MAX_ROI_RAW = 14
-    LIVE_STATIONARY_CAPTURE_EXP_MS = 0.6
+    LIVE_STATIONARY_CAPTURE_EXP_MS = 1.2
     LIVE_STATIONARY_CAPTURE_GAIN_ANALOG = 1.0
     LIVE_STATIONARY_CAPTURE_GAIN_DIGITAL = 1.0
     LIVE_STATIONARY_CAPTURE_FPS_REQUEST = 1640.0
@@ -503,6 +505,8 @@ class BasicVideoPlayer:
         return float(score)
 
     def _apply_ring_filter(self, force: bool = False) -> None:
+        if getattr(self, "_analysis_detection_mode", "Time variation") == "Intensity":
+            return
         # Final filter: keep only spots whose XY scatter is annulus-like.
         # IMPORTANT: do not hold the analysis lock while computing ring scores (can be slow and blocks UI).
         with self._analysis_lock:
@@ -705,6 +709,8 @@ class BasicVideoPlayer:
         with self._analysis_lock:
             self._background_profile = arr
             self._background_profile_path = out_path
+        if self._live_intensity_running:
+            self._prepare_live_intensity_background()
         self._refresh_background_profile_info()
         if source_path is not None:
             self.bottom_var.set(f"Active background profile: {source_path}")
@@ -995,8 +1001,9 @@ class BasicVideoPlayer:
         frame_shape: tuple[int, int],
         roi: Optional[dict | tuple[int, int, int, int]] = None,
         base_dir: Optional[Path] = None,
+        profile: Optional[np.ndarray] = None,
     ) -> Optional[np.ndarray]:
-        prof = self._load_background_profile(base_dir=base_dir)
+        prof = profile if profile is not None else self._load_background_profile(base_dir=base_dir)
         if prof is None:
             return None
         fh, fw = int(frame_shape[0]), int(frame_shape[1])
@@ -1027,6 +1034,7 @@ class BasicVideoPlayer:
         frame: np.ndarray,
         roi: Optional[dict | tuple[int, int, int, int]] = None,
         base_dir: Optional[Path] = None,
+        profile: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         arr = np.asarray(frame)
         if arr.ndim != 2:
@@ -1035,6 +1043,7 @@ class BasicVideoPlayer:
             frame_shape=(int(arr.shape[0]), int(arr.shape[1])),
             roi=roi,
             base_dir=base_dir,
+            profile=profile,
         )
         if bg is None:
             return np.array(arr, copy=True)
@@ -1186,6 +1195,7 @@ class BasicVideoPlayer:
         gain_analog: Optional[float],
         subtract_background: bool,
         sound_meta: Optional[dict] = None,
+        conditions: Optional[dict] = None,
     ) -> tuple[Path, Optional[float]]:
         script = Path(__file__).resolve().parent / "fetch_frames.py"
         out_dir = out_path.parent
@@ -1259,7 +1269,7 @@ class BasicVideoPlayer:
             roi=(data.get("roi") if isinstance(data.get("roi"), dict) else {}),
             background=bg_meta,
             sound=sound_meta,
-            extra={"fetch_frames_output": data},
+            extra={"fetch_frames_output": data, "conditions": dict(conditions or {})},
         )
         return path, actual_fps
 
@@ -1272,6 +1282,7 @@ class BasicVideoPlayer:
         gain_analog: float,
         subtract_background: bool,
         sound_meta: Optional[dict] = None,
+        conditions: Optional[dict] = None,
     ) -> None:
         try:
             out_dir = self._infill_training_stacks_dir()
@@ -1279,7 +1290,8 @@ class BasicVideoPlayer:
             out_path = out_dir / f"frame_stack_{ts}.npy"
             self._ui_call(self.bottom_var.set, f"Fetching {n_frames} frame(s) to {out_dir}...")
             saved_path, actual_fps = self._capture_frames_to_npy(
-                out_path, n_frames, fps, exp_ms, gain_analog, subtract_background, sound_meta=sound_meta
+                out_path, n_frames, fps, exp_ms, gain_analog, subtract_background,
+                sound_meta=sound_meta, conditions=conditions,
             )
         except Exception as e:
             self._ui_call(self._show_error, "Fetch frames", str(e))
@@ -1289,6 +1301,8 @@ class BasicVideoPlayer:
                 if not self._close_video():
                     self._set_fetch_busy(False)
                     return
+                if conditions:
+                    self._detection_mode_var.set(conditions["detector"])
                 if self._load_npy_source(str(saved_path)):
                     use_fps = actual_fps if actual_fps and actual_fps > 0.0 else fps
                     if use_fps and use_fps > 0.0:
@@ -1333,6 +1347,7 @@ class BasicVideoPlayer:
             return
         self._set_fetch_busy(True)
         sound_meta = self._sound_metadata()
+        conditions = self._capture_conditions()
         t = threading.Thread(
             target=self._fetch_frames_worker,
             args=(
@@ -1342,6 +1357,7 @@ class BasicVideoPlayer:
                 float(gain_analog),
                 subtract_background,
                 sound_meta,
+                conditions,
             ),
             daemon=True,
         )
@@ -1367,6 +1383,8 @@ class BasicVideoPlayer:
 
     def _on_live_background_toggle(self) -> None:
         self._live_background_subtract_enabled = bool(self._live_background_subtract_var.get())
+        if self._live_intensity_running:
+            self._prepare_live_intensity_background()
 
     def _clear_all_caches(self) -> None:
         """
@@ -1440,6 +1458,21 @@ class BasicVideoPlayer:
         self._ui_queue: "queue.Queue[tuple[object, tuple, dict]]" = queue.Queue()
         self._ui_pump_after_id = None
         self._sound_on_var = tk.BooleanVar(value=False)
+        self._detection_mode_var = tk.StringVar(value="Time variation")
+        self._analysis_detection_mode = "Time variation"
+        self._capture_role_var = tk.StringVar(value="Sample")
+        self._interference_state_var = tk.StringVar(value="Unknown")
+        self._capture_condition_note_var = tk.StringVar(value="")
+        self._source_recording_metadata = []
+        self._source_phase = {}
+        self._intensity_channels = None
+        self._intensity_mean_frame = None
+        self._intensity_origin = (0, 0)
+        self._intensity_origin_source = "assumed_full_frame"
+        self._intensity_distribution_window = None
+        self._intensity_average_var = tk.StringVar(value="3D Cartesian")
+        self._intensity_window_var = tk.StringVar(value="All")
+        self._intensity_medium_var = tk.StringVar(value="water")
         self._dir_filter_enabled_var = tk.BooleanVar(value=False)
         self._dir_filter_enabled = False
         self._dir_filter_base = ([], [], [])
@@ -1481,12 +1514,12 @@ class BasicVideoPlayer:
         # Fetch-frames controls
         self._fetch_busy = False
         self._fetch_sync_lock = False
-        self._fetch_exp_ms_var = tk.StringVar(value="0.6")
+        self._fetch_exp_ms_var = tk.StringVar(value="1.2")
         self._fetch_gain_analog_var = tk.StringVar(value="1.0")
         self._fetch_fps_var = tk.StringVar(value="78")
         self._fetch_n_var = tk.StringVar(value="150")
         self._fetch_dur_var = tk.StringVar(value="")
-        self._fetch_background_subtract_var = tk.BooleanVar(value=True)
+        self._fetch_background_subtract_var = tk.BooleanVar(value=False)
         self._fetch_btn = None
         self._fetch_close_btn = None
         self._sync_fetch_from("fps")
@@ -1534,6 +1567,43 @@ class BasicVideoPlayer:
         self._live_intensity_plot_interval_s = 0.10
         self._live_intensity_preview_interval_s = 0.10
         self._live_intensity_window_s = 10.0
+        self._live_intensity_background = None
+        self._live_intensity_background_crop = None
+        self._live_intensity_background_key = None
+        self._live_intensity_started_at = None
+        self._live_intensity_last_received_at = None
+        self._live_intensity_frame_age = 0.0
+        self._live_intensity_figure = None
+        self._live_intensity_canvas = None
+        self._live_intensity_axis = None
+        self._live_intensity_line = None
+        self._live_intensity_timing_snapshot = None
+        self._live_intensity_gains_snapshot = None
+        self._live_intensity_roi_snapshot = None
+        self._live_intensity_gains_cb = None
+        self._live_intensity_error_cb = None
+        self._live_intensity_error = None
+        self._live_intensity_frame_shape = None
+        self._intensity_tuner = IntensityTuner()
+        self._intensity_tuning_window = None
+        self._intensity_tuning_tree = None
+        self._intensity_tuning_buttons = {}
+        self._intensity_tuning_label_var = tk.StringVar(value="Trial 1")
+        self._intensity_tuning_drive_var = tk.StringVar(value="")
+        self._intensity_tuning_duration_var = tk.StringVar(value="5")
+        self._intensity_tuning_target_var = tk.StringVar(value="10")
+        self._intensity_tuning_confirm_var = tk.BooleanVar(value=False)
+        self._intensity_tuning_status_var = tk.StringVar(value="No reference recorded")
+        self._intensity_tuning_reference_var = tk.StringVar(value="Reference: -")
+        self._intensity_tuning_best_var = tk.StringVar(value="Best completed trial: -")
+        self._intensity_tuning_settings_var = tk.StringVar(value="Camera readback: -")
+        self._intensity_tuning_progress = tk.DoubleVar(value=0.0)
+        self._intensity_diagnostic = IntensityDiagnostic()
+        self._intensity_diagnostic_path = None
+        self._intensity_diagnostic_saved = True
+        self._intensity_diagnostic_save_attempted = False
+        self._intensity_diagnostic_duration_var = tk.StringVar(value="60")
+        self._intensity_diagnostic_status_var = tk.StringVar(value="No diagnostic recording")
         # Spot capture (tab 3)
         self._spotrec_running = False
         self._spotrec_controller = None
@@ -1550,9 +1620,9 @@ class BasicVideoPlayer:
         self._spotrec_out_path = None
         self._spotrec_roi_meta = None
         self._spotrec_fps_var = tk.StringVar(value="2000")
-        self._spotrec_exp_ms_var = tk.StringVar(value="0.6")
+        self._spotrec_exp_ms_var = tk.StringVar(value="1.2")
         self._spotrec_gain_analog_var = tk.StringVar(value="1.0")
-        self._spotrec_background_subtract_var = tk.BooleanVar(value=True)
+        self._spotrec_background_subtract_var = tk.BooleanVar(value=False)
         self._spotrec_size_var = tk.StringVar(value="11")
         self._spotrec_spot_var = tk.StringVar(value="Spot - / -")
         self._spotrec_status_var = tk.StringVar(value="Idle")
@@ -1588,14 +1658,14 @@ class BasicVideoPlayer:
         self._spotrec_hand_ref = None
         self._live_start_btn = None
         self._live_stop_btn = None
-        self._live_exp_ms_var = tk.StringVar(value="0.6")
-        self._live_gain_var = tk.StringVar(value="20")
+        self._live_exp_ms_var = tk.StringVar(value="1.2")
+        self._live_gain_var = tk.StringVar(value="1.0")
         self._live_status_var = tk.StringVar(value="Live feed stopped")
         self._live_theta_var = tk.StringVar(value="")
         self._live_mag_enabled_var = tk.BooleanVar(value=False)
-        self._live_background_subtract_var = tk.BooleanVar(value=True)
-        self._live_background_subtract_enabled = True
-        self._live_capture_background_subtract_var = tk.BooleanVar(value=True)
+        self._live_background_subtract_var = tk.BooleanVar(value=False)
+        self._live_background_subtract_enabled = False
+        self._live_capture_background_subtract_var = tk.BooleanVar(value=False)
         self._live_background_capture_btn = None
         self._live_background_select_btn = None
         self._live_display_stretch_var = tk.BooleanVar(value=False)
@@ -1740,7 +1810,7 @@ class BasicVideoPlayer:
         self._stationary_capture_gain_analog_var = tk.StringVar(
             value=f"{self.STATIONARY_REC_GAIN_DEFAULT:.2f}"
         )
-        self._stationary_capture_background_subtract_var = tk.BooleanVar(value=True)
+        self._stationary_capture_background_subtract_var = tk.BooleanVar(value=False)
         self._stationary_capture_status_var = tk.StringVar(value="Stationary capture idle.")
         self._stationary_capture_running = False
         self._stationary_capture_lock = threading.Lock()
@@ -1832,6 +1902,7 @@ class BasicVideoPlayer:
             text="Sound on / vibrating",
             variable=self._sound_on_var,
         ).pack(side=tk.LEFT)
+        ttk.Button(global_bar, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.LEFT, padx=(12, 0))
 
         notebook = ttk.Notebook(self.root)
         notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -1911,9 +1982,18 @@ class BasicVideoPlayer:
         self._live_img_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._live_img_label.bind("<Button-1>", self._on_live_click)
 
-        right = ttk.Frame(view, width=self._live_zoom_output_px, height=self._live_zoom_output_px + 430)
-        right.grid(row=0, column=1, sticky="n", padx=(10, 0))
-        right.grid_propagate(False)
+        right_outer = ttk.Frame(view)
+        right_outer.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        right_canvas = tk.Canvas(right_outer, width=340, highlightthickness=0)
+        right_scroll = ttk.Scrollbar(right_outer, orient=tk.VERTICAL, command=right_canvas.yview)
+        right_canvas.configure(yscrollcommand=right_scroll.set)
+        right_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        right_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        right = ttk.Frame(right_canvas)
+        right_window = right_canvas.create_window((0, 0), window=right, anchor="nw")
+        right.bind("<Configure>", lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")))
+        right_canvas.bind("<Configure>", lambda event: right_canvas.itemconfigure(right_window, width=event.width))
+        self._live_controls_canvas = right_canvas
         ttk.Label(parent, textvariable=self._stationary_save_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
             side=tk.TOP, anchor="w", fill=tk.X
         )
@@ -2006,6 +2086,7 @@ class BasicVideoPlayer:
         )
         analyser = ttk.LabelFrame(right, text="Live intensity analyser")
         analyser.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Button(analyser, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.TOP, anchor="w", pady=(0, 4))
         self._live_intensity_start_btn = ttk.Button(
             analyser,
             text="Start analysing magnified region",
@@ -2015,7 +2096,7 @@ class BasicVideoPlayer:
         self._live_intensity_stop_btn = ttk.Button(
             analyser,
             text="Stop analysing",
-            command=self._stop_live_intensity_analysis,
+            command=self._on_stop_live_intensity_analysis,
         )
         self._live_intensity_stop_btn.state(["disabled"])
         self._live_intensity_stop_btn.pack(side=tk.TOP, anchor="w", pady=(4, 0))
@@ -2066,6 +2147,19 @@ class BasicVideoPlayer:
         ttk.Label(top, text="Uses stored background profile").pack(side=tk.LEFT, padx=(6, 0))
         self.status_var = tk.StringVar(value="No video loaded")
         ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
+        conditions = ttk.Frame(parent, padding=(8, 0, 8, 4))
+        conditions.pack(side=tk.TOP, fill=tk.X)
+        ttk.Label(conditions, text="Detection").pack(side=tk.LEFT)
+        ttk.Combobox(conditions, textvariable=self._detection_mode_var, values=("Time variation", "Intensity"),
+                 state="readonly", width=15).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(conditions, text="Recording").pack(side=tk.LEFT)
+        ttk.Combobox(conditions, textvariable=self._capture_role_var, values=("Sample", "Background"),
+                 state="readonly", width=12).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(conditions, text="Interference drive (manual)").pack(side=tk.LEFT)
+        ttk.Combobox(conditions, textvariable=self._interference_state_var, values=("Unknown", "On", "Off"),
+                 state="readonly", width=9).pack(side=tk.LEFT, padx=(6, 12))
+        ttk.Label(conditions, text="Condition note").pack(side=tk.LEFT)
+        ttk.Entry(conditions, textvariable=self._capture_condition_note_var, width=24).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
         ttk.Label(parent, textvariable=self._fetch_save_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
             side=tk.TOP, anchor="w", fill=tk.X
         )
@@ -2134,19 +2228,21 @@ class BasicVideoPlayer:
         self._dog_k_var = tk.StringVar(value=f"{self._dog_k_std:.2f}")
         ttk.Entry(params, textvariable=self._dog_k_var, width=10).grid(row=0, column=1, sticky="w", padx=(6, 0))
 
-        ttk.Label(params, text="Phi window").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(params, text="Spot window").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self._spot_win_var = tk.StringVar(value=str(self._spot_window_size))
         ttk.Entry(params, textvariable=self._spot_win_var, width=10).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Label(params, text="Min Hollowness Score").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self._ring_score_min_var = tk.StringVar(value=f"{self._ring_score_min:.2f}")
-        ttk.Entry(params, textvariable=self._ring_score_min_var, width=10).grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
-        ttk.Checkbutton(
+        self._ring_score_entry = ttk.Entry(params, textvariable=self._ring_score_min_var, width=10)
+        self._ring_score_entry.grid(row=2, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+        self._motion_range_checkbox = ttk.Checkbutton(
             params,
             text=f"Filter max(range(X), range(Y)) > {self.ABS_RANGE_MIN:.2f}",
             variable=self._abs_range_filter_enabled_var,
             command=self._on_abs_range_filter_toggle,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        )
+        self._motion_range_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self._auto_inspect_chk = ttk.Checkbutton(
             params,
             text=f"Auto inspect top {self.AUTO_INSPECT_TOP_N} spots after analysis",
@@ -2159,9 +2255,22 @@ class BasicVideoPlayer:
         self._spot_update_btn = ttk.Button(controls, text="Update analysis", command=self._apply_spot_params)
         self._spot_update_btn.pack(side=tk.TOP, anchor="w", pady=(8, 0))
 
+        orientation = ttk.LabelFrame(controls, text="Intensity orientation")
+        orientation.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
+        ttk.Label(orientation, text="Average in").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(orientation, textvariable=self._intensity_average_var, values=intensity_spots.AVERAGING_METHODS,
+                     state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(orientation, text="Frames / average").grid(row=1, column=0, sticky="w", pady=4)
+        ttk.Entry(orientation, textvariable=self._intensity_window_var, width=12).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(orientation, text="Theta model (finite-NA)").grid(row=2, column=0, sticky="w")
+        ttk.Combobox(orientation, textvariable=self._intensity_medium_var, values=tuple(self.THETA_RECON_MODELS),
+                     state="readonly", width=18).grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Button(orientation, text="All-rod distribution", command=self._open_intensity_distribution).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=6)
+
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
 
-        ttk.Label(right, text="S-map window").pack(side=tk.TOP, anchor="w")
+        ttk.Label(right, text="Detection-map window").pack(side=tk.TOP, anchor="w")
         self._spot_img_label = ttk.Label(right)
         self._spot_img_label.pack(side=tk.TOP, anchor="w", pady=(2, 10))
 
@@ -3072,6 +3181,15 @@ class BasicVideoPlayer:
         return {
             "sound_on": bool(self._sound_on_var.get()),
             "source": "manual_gui_checkbox",
+        }
+
+    def _capture_conditions(self) -> dict:
+        return {
+            "recording_role": self._capture_role_var.get(),
+            "interference_drive": self._interference_state_var.get(),
+            "condition_note": self._capture_condition_note_var.get().strip(),
+            "source": "manual_operator_declaration_not_hardware_readback",
+            "detector": self._detection_mode_var.get(),
         }
 
     def _background_metadata(
@@ -4710,6 +4828,7 @@ class BasicVideoPlayer:
             messagebox.showerror("Live intensity", f"Could not start camera controller: {e}")
             return
 
+        resume_live_on_error = self._live_running
         if self._live_running:
             self._stop_live_feed()
 
@@ -4719,8 +4838,18 @@ class BasicVideoPlayer:
         self._live_intensity_preview_queue = queue.Queue(maxsize=1)
         self._live_intensity_frame_i = 0
         self._live_intensity_fps = float(fps_req)
+        self._live_intensity_started_at = time.perf_counter()
+        self._live_intensity_last_received_at = None
+        self._live_intensity_timing_snapshot = None
+        self._live_intensity_gains_snapshot = None
+        self._live_intensity_roi_snapshot = None
+        self._live_intensity_frame_shape = None
+        self._live_intensity_error = None
+        self._intensity_tuner.reset()
+        self._intensity_tuning_status_var.set("New camera session: record a reference")
         self._live_intensity_last_plot_ts = 0.0
         self._live_intensity_last_preview_ts = 0.0
+        self._prepare_live_intensity_background()
         self._live_intensity_roi_meta = {
             "x": int(roi_req["x"]),
             "y": int(roi_req["y"]),
@@ -4736,15 +4865,18 @@ class BasicVideoPlayer:
         def _on_timing(payload: object) -> None:
             try:
                 d = dict(payload or {})
-                rf = d.get("resulting_fps", d.get("fps"))
+                self._live_intensity_timing_snapshot = d
+                rf = d.get("resulting_fps") or d.get("fps")
                 if rf is not None and float(rf) > 0.0:
                     self._live_intensity_fps = float(rf)
+                self._mark_intensity_diagnostic("Timing readback")
             except Exception:
                 return
 
         def _on_roi(payload: object) -> None:
             try:
                 d = dict(payload or {})
+                self._live_intensity_roi_snapshot = d
                 meta = self._live_intensity_roi_meta
                 if not isinstance(meta, dict):
                     return
@@ -4762,17 +4894,32 @@ class BasicVideoPlayer:
                     meta["h"] = int(round(float(rh)))
                 meta["phase_x"] = int(meta.get("x", 0)) % 2
                 meta["phase_y"] = int(meta.get("y", 0)) % 2
+                self._mark_intensity_diagnostic("ROI readback")
             except Exception:
                 return
 
+        def _on_gains(payload: object) -> None:
+            self._live_intensity_gains_snapshot = dict(payload or {})
+            self._mark_intensity_diagnostic("Gain readback")
+
+        def _on_error(message: str) -> None:
+            self._live_intensity_error = str(message)
+            self._mark_intensity_diagnostic(f"Camera error: {message}")
+
         self._live_intensity_timing_cb = _on_timing
         self._live_intensity_roi_cb = _on_roi
+        self._live_intensity_gains_cb = _on_gains
+        self._live_intensity_error_cb = _on_error
         try:
             ctl = self._live_intensity_controller
-            ctl.open()
             ctl.cam.timing.connect(_on_timing)
             ctl.cam.roi.connect(_on_roi)
-            ctl.cam.frame.connect(self._live_intensity_on_frame)
+            ctl.cam.gains.connect(_on_gains)
+            ctl.cam.error.connect(_on_error)
+            ctl.cam.frame_timed.connect(self._live_intensity_on_frame)
+            ctl.open()
+            if self._live_intensity_error:
+                raise RuntimeError(self._live_intensity_error)
             ctl.set_roi(
                 float(roi_req["w"]),
                 float(roi_req["h"]),
@@ -4790,18 +4937,19 @@ class BasicVideoPlayer:
                 ctl.set_gains(float(gain_analog), None)
             try:
                 ctl.refresh_timing()
+                ctl.refresh_gains()
             except Exception:
                 pass
             ctl.start()
         except Exception as e:
-            try:
-                self._live_intensity_controller.close()
-            except Exception:
-                pass
-            self._live_intensity_controller = None
+            self._stop_live_intensity_analysis()
             messagebox.showerror("Live intensity", f"Could not start live intensity analysis: {e}")
+            if resume_live_on_error:
+                self._start_live_feed(preserve_zoom=True)
             return
 
+        self._set_live_zoom_center(center, reset_xy=True)
+        self._live_mag_enabled_var.set(True)
         self._live_intensity_running = True
         if self._live_intensity_start_btn is not None:
             self._live_intensity_start_btn.state(["disabled"])
@@ -4815,7 +4963,20 @@ class BasicVideoPlayer:
         self._live_render_intensity_plot(force=True)
         self._live_intensity_tick()
 
+    def _on_stop_live_intensity_analysis(self) -> None:
+        was_active = self._live_intensity_running or self._live_intensity_controller is not None
+        self._stop_live_intensity_analysis()
+        if not was_active or self._notebook.select() != str(self._live_tab):
+            return
+        if self._spotrec_running or self._spotrec_proc is not None:
+            return
+        if self._live_capture_running or self._stationary_capture_running or self._fetch_busy:
+            return
+        self._live_mag_enabled_var.set(True)
+        self._start_live_feed(preserve_zoom=True)
+
     def _stop_live_intensity_analysis(self) -> None:
+        self._finish_intensity_diagnostic("analyser_stopped")
         if self._live_intensity_after_id is not None:
             try:
                 self.root.after_cancel(self._live_intensity_after_id)
@@ -4823,10 +4984,12 @@ class BasicVideoPlayer:
                 pass
             self._live_intensity_after_id = None
         self._live_intensity_running = False
+        self._intensity_tuner.reset()
+        self._intensity_tuning_status_var.set("Analyser stopped; record a new reference after restart")
         ctl = self._live_intensity_controller
         if ctl is not None:
             try:
-                ctl.cam.frame.disconnect(self._live_intensity_on_frame)
+                ctl.cam.frame_timed.disconnect(self._live_intensity_on_frame)
             except Exception:
                 pass
             try:
@@ -4841,6 +5004,12 @@ class BasicVideoPlayer:
                     ctl.cam.roi.disconnect(cb)
             except Exception:
                 pass
+            for signal, callback in ((ctl.cam.gains, self._live_intensity_gains_cb), (ctl.cam.error, self._live_intensity_error_cb)):
+                if callback is not None:
+                    try:
+                        signal.disconnect(callback)
+                    except Exception:
+                        pass
             try:
                 ctl.stop()
             except Exception:
@@ -4864,50 +5033,436 @@ class BasicVideoPlayer:
         self._live_intensity_status_var.set("Intensity analyser stopped.")
         self._live_intensity_timing_cb = None
         self._live_intensity_roi_cb = None
+        self._live_intensity_gains_cb = None
+        self._live_intensity_error_cb = None
+        self._update_intensity_tuning()
+
+    def _prepare_live_intensity_background(self) -> None:
+        self._live_intensity_background = (
+            self._load_background_profile(base_dir=Path.cwd())
+            if self._live_background_subtract_enabled else None
+        )
+        self._live_intensity_background_crop = None
+        self._live_intensity_background_key = None
+        with self._live_intensity_lock:
+            self._live_intensity_buffer.clear()
+        self._intensity_tuner.reset()
+        self._intensity_tuning_status_var.set("Background state changed; new reference required")
+        self._mark_intensity_diagnostic("Background state changed")
+
+    def _open_intensity_tuning(self) -> None:
+        if self._intensity_tuning_window is not None and self._intensity_tuning_window.winfo_exists():
+            self._intensity_tuning_window.lift()
+            return
+        window = tk.Toplevel(self.root)
+        window.title("Interference tuning")
+        window.geometry("800x690")
+        window.minsize(730, 640)
+        self._intensity_tuning_window = window
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(7, weight=1)
+        fields = ttk.Frame(window, padding=10)
+        fields.grid(row=0, column=0, sticky="ew")
+        fields.columnconfigure(1, weight=1)
+        ttk.Label(fields, text="Trial / Vpp label").grid(row=0, column=0, sticky="w")
+        ttk.Entry(fields, textvariable=self._intensity_tuning_label_var, width=25).grid(row=0, column=1, sticky="ew", padx=(8, 16))
+        ttk.Label(fields, text="Window (s)").grid(row=0, column=2)
+        ttk.Spinbox(fields, from_=2, to=30, textvariable=self._intensity_tuning_duration_var, width=6).grid(row=0, column=3, padx=6)
+        ttk.Label(fields, text="Target (x)").grid(row=0, column=4)
+        ttk.Spinbox(fields, from_=2, to=100, textvariable=self._intensity_tuning_target_var, width=6).grid(row=0, column=5, padx=6)
+        ttk.Label(fields, text="Drive setup note").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(fields, textvariable=self._intensity_tuning_drive_var).grid(row=1, column=1, columnspan=5, sticky="ew", padx=(8, 0), pady=(8, 0))
+        ttk.Checkbutton(window, text="Comparable Z sweeps; amplitude held fixed for this trial", variable=self._intensity_tuning_confirm_var).grid(row=1, column=0, sticky="w", padx=10)
+        commands = ttk.Frame(window, padding=10)
+        commands.grid(row=2, column=0, sticky="ew")
+        actions = (
+            ("start", "Start analysing", self._start_live_intensity_analysis),
+            ("stop", "Stop analysing", self._on_stop_live_intensity_analysis),
+            ("reference", "Record reference", lambda: self._begin_intensity_trial("reference")),
+            ("test", "Test amplitude", lambda: self._begin_intensity_trial("test")),
+            ("cancel", "Cancel trial", self._cancel_intensity_trial),
+            ("save", "Save trials", self._save_intensity_trials),
+            ("clear", "Clear trials", self._clear_intensity_trials),
+        )
+        for key, text, command in actions:
+            button = ttk.Button(commands, text=text, command=command)
+            button.pack(side=tk.LEFT, padx=(0, 6))
+            self._intensity_tuning_buttons[key] = button
+        ttk.Progressbar(window, maximum=100, variable=self._intensity_tuning_progress).grid(row=3, column=0, sticky="ew", padx=10)
+        result = ttk.Frame(window, padding=10)
+        result.grid(row=4, column=0, sticky="ew")
+        for variable in (self._intensity_tuning_status_var, self._intensity_tuning_reference_var, self._intensity_tuning_best_var):
+            ttk.Label(result, textvariable=variable, wraplength=710, justify=tk.LEFT).pack(side=tk.TOP, anchor="w", pady=3)
+        ttk.Label(window, textvariable=self._intensity_tuning_settings_var, wraplength=710, justify=tk.LEFT).grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+        diagnostics = ttk.LabelFrame(window, text="Intensity diagnostic", padding=8)
+        diagnostics.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Label(diagnostics, text="Duration (s)").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(diagnostics, from_=10, to=120, textvariable=self._intensity_diagnostic_duration_var, width=5).grid(row=0, column=1, padx=6)
+        for column, (key, text, command) in enumerate((
+            ("diagnostic_start", "Record diagnostic", self._begin_intensity_diagnostic),
+            ("diagnostic_stop", "Stop and save", self._finish_intensity_diagnostic),
+            ("diagnostic_mark", "Mark event", self._mark_intensity_diagnostic),
+            ("diagnostic_save", "Retry save", self._save_intensity_diagnostic),
+        ), start=2):
+            button = ttk.Button(diagnostics, text=text, command=command)
+            button.grid(row=0, column=column, padx=(0, 6))
+            self._intensity_tuning_buttons[key] = button
+        ttk.Label(diagnostics, textvariable=self._intensity_diagnostic_status_var, wraplength=670, justify=tk.LEFT).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        table = ttk.Frame(window, padding=(10, 0, 10, 10))
+        table.grid(row=7, column=0, sticky="nsew")
+        columns = ("kind", "label", "span", "ratio", "relative", "state")
+        tree = ttk.Treeview(table, columns=columns, show="headings", height=8)
+        for key, title, width in zip(columns, ("Type", "Trial", "Span (DN)", "Reduction", "Normalized", "Result"), (70, 120, 90, 90, 90, 200)):
+            tree.heading(key, text=title)
+            tree.column(key, width=width, minwidth=55)
+        scrollbar = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self._intensity_tuning_tree = tree
+        window.protocol("WM_DELETE_WINDOW", self._close_intensity_tuning)
+        self._refresh_intensity_trial_table()
+        self._update_intensity_tuning()
+
+    def _close_intensity_tuning(self) -> None:
+        self._finish_intensity_diagnostic("window_closed")
+        if not self._intensity_diagnostic_saved:
+            self._show_error("Unsaved diagnostic", "The diagnostic is still in memory. Resolve the save error and use Retry save before closing.")
+            return
+        self._cancel_intensity_trial()
+        self._intensity_tuning_window.destroy()
+        self._intensity_tuning_window = None
+        self._intensity_tuning_tree = None
+        self._intensity_tuning_buttons = {}
+
+    def _intensity_tuning_context(self) -> dict:
+        if not self._live_intensity_running:
+            raise ValueError("Start magnifier analysis first")
+        if self._live_intensity_error:
+            raise ValueError(f"Camera error: {self._live_intensity_error}")
+        if self._live_background_subtract_enabled:
+            raise ValueError("Turn background subtraction off for interference tuning")
+        timing = self._live_intensity_timing_snapshot or {}
+        gains = self._live_intensity_gains_snapshot or {}
+        roi = self._live_intensity_roi_meta or {}
+        readback = self._live_intensity_roi_snapshot or {}
+        if any(readback.get(key) is None for key in ("Width", "Height", "OffsetX", "OffsetY")):
+            raise ValueError("Waiting for actual ROI readback")
+        try:
+            context = {
+                "fps": float(timing.get("resulting_fps") or timing.get("fps")),
+                "exposure_us": float(timing.get("exposure_us")),
+                "gain_analog": float((gains.get("analog") or {}).get("val")),
+                "gain_digital": float((gains.get("digital") or {}).get("val")),
+            }
+        except (TypeError, ValueError):
+            raise ValueError("Waiting for actual timing and gain readbacks") from None
+        if not all(np.isfinite(value) for value in context.values()) or context["fps"] <= 0.0 or context["exposure_us"] <= 0.0:
+            raise ValueError("Invalid camera readback")
+        if self._live_intensity_last_received_at is None or self._live_intensity_frame_shape is None:
+            raise ValueError("Waiting for timestamped camera frames")
+        if time.perf_counter() - self._live_intensity_last_received_at > 0.5:
+            raise ValueError("No recent camera frame; check stream or GUI backlog")
+        context["roi"] = {key: roi.get(key) for key in ("x", "y", "w", "h", "cx", "cy", "win_raw")}
+        context["frame_shape"] = list(self._live_intensity_frame_shape)
+        context["pixel_format"] = "Mono12 in uint16 (backend contract)"
+        context["background_subtracted"] = False
+        context["drive_note_manual"] = self._intensity_tuning_drive_var.get().strip()
+        return context
+
+    def _begin_intensity_trial(self, kind: str) -> None:
+        try:
+            if not self._intensity_tuning_confirm_var.get():
+                raise ValueError("Confirm comparable Z sweeps and fixed trial amplitude")
+            context = self._intensity_tuning_context()
+            self._intensity_tuner.begin(
+                kind, self._intensity_tuning_label_var.get(), context, time.perf_counter(),
+                duration=float(self._intensity_tuning_duration_var.get()),
+                target=float(self._intensity_tuning_target_var.get()),
+            )
+            self._intensity_tuner.active["operator_confirmed_comparable_sweep"] = True
+            self._intensity_tuning_confirm_var.set(False)
+            self._update_intensity_tuning()
+        except ValueError as exc:
+            self._intensity_tuning_status_var.set(str(exc))
+
+    def _cancel_intensity_trial(self) -> None:
+        if self._intensity_tuner.active is not None:
+            self._intensity_tuner.active = None
+            self._intensity_tuner.last = None
+            self._intensity_tuning_status_var.set("Trial cancelled; incomplete data not retained")
+        self._intensity_tuning_progress.set(0.0)
+
+    def _clear_intensity_trials(self) -> None:
+        self._intensity_tuner.reset()
+        self._intensity_tuner.trials.clear()
+        self._intensity_tuning_status_var.set("No reference recorded")
+        self._intensity_tuning_progress.set(0.0)
+        self._intensity_tuning_reference_var.set("Reference: -")
+        self._intensity_tuning_best_var.set("Best completed trial: -")
+        self._refresh_intensity_trial_table()
+
+    def _update_intensity_tuning(self) -> None:
+        diagnostic = self._intensity_diagnostic
+        if diagnostic.active:
+            elapsed = time.perf_counter() - diagnostic.started_at
+            if elapsed >= diagnostic.duration + 0.25:
+                self._finish_intensity_diagnostic("duration")
+            else:
+                self._intensity_diagnostic_status_var.set(
+                    f"Recording {min(elapsed, diagnostic.duration):.1f}/{diagnostic.duration:g} s | {diagnostic.count} samples\n{self._intensity_diagnostic_path}"
+                )
+        elif not self._intensity_diagnostic_saved and not self._intensity_diagnostic_save_attempted and diagnostic.metadata.get("stop_reason") == "sample_limit":
+            self._save_intensity_diagnostic()
+        tuner = self._intensity_tuner
+        try:
+            context = self._intensity_tuning_context()
+            self._intensity_tuning_settings_var.set(
+                f"Actual: {context['exposure_us'] / 1000:.3f} ms | {context['fps']:.1f} fps | "
+                f"gain A/D {context['gain_analog']:.3g}/{context['gain_digital']:.3g} | "
+                f"delivery age {1000 * self._live_intensity_frame_age:.0f} ms"
+            )
+            source = tuner.active or tuner.reference
+            if source is not None and source["context"] != context:
+                raise ValueError("Camera/ROI/drive setup changed; record a new reference")
+        except ValueError as exc:
+            if tuner.active is not None or tuner.reference is not None:
+                tuner.reset()
+                self._intensity_tuning_status_var.set(str(exc))
+            self._intensity_tuning_settings_var.set(str(exc))
+        before = len(tuner.trials)
+        result = tuner.update(time.perf_counter())
+        if result is not None:
+            stats = result["stats"]
+            prefix = "Complete" if result["complete"] else f"Collecting {result['elapsed_s']:.1f}/{result['duration_s']:g} s"
+            if result["elapsed_s"] == 0.0:
+                prefix = "Settling (0.5 s)"
+            self._intensity_tuning_progress.set(100 * result["elapsed_s"] / result["duration_s"])
+            parts = [prefix]
+            if stats is not None:
+                parts.append(f"span {stats['span']:.2f} DN; mean {stats['mean']:.1f} DN")
+            comparison = result["comparison"]
+            if comparison is not None:
+                parts.append(f"{self._tuning_ratio_text(comparison['reduction'])} reduction; {self._tuning_ratio_text(comparison['relative_reduction'])} normalized")
+                if comparison["target_reached"]:
+                    parts.append(f">= {result['target']:g}x observed target")
+            if result["warnings"]:
+                parts.append("; ".join(result["warnings"]))
+            self._intensity_tuning_status_var.set(" | ".join(parts))
+        reference = tuner.reference
+        self._intensity_tuning_reference_var.set(
+            f"Reference: {reference['label']} | span {reference['stats']['span']:.2f} DN | mean {reference['stats']['mean']:.1f} DN"
+            if reference is not None else "Reference: -"
+        )
+        eligible = [trial for trial in tuner.trials if reference is not None and trial["reference_id"] == reference["id"] and not trial["warnings"] and trial["comparison"] is not None]
+        best = max(eligible, key=lambda trial: trial["comparison"]["relative_reduction"], default=None)
+        self._intensity_tuning_best_var.set(
+            f"Best completed trial: {best['label']} | {self._tuning_ratio_text(best['comparison']['reduction'])} reduction; {self._tuning_ratio_text(best['comparison']['relative_reduction'])} normalized"
+            if best is not None else "Best completed trial: -"
+        )
+        for key, button in self._intensity_tuning_buttons.items():
+            enabled = {
+                "start": not self._live_intensity_running and self._notebook.select() == str(self._live_tab),
+                "stop": self._live_intensity_running,
+                "reference": self._live_intensity_running and tuner.active is None,
+                "test": self._live_intensity_running and reference is not None and tuner.active is None,
+                "cancel": tuner.active is not None,
+                "save": bool(tuner.trials) and tuner.active is None,
+                "clear": tuner.active is None,
+                "diagnostic_start": self._live_intensity_running and not diagnostic.active and self._intensity_diagnostic_saved,
+                "diagnostic_stop": diagnostic.active,
+                "diagnostic_mark": diagnostic.active,
+                "diagnostic_save": not diagnostic.active and not self._intensity_diagnostic_saved,
+            }[key]
+            button.configure(state=tk.NORMAL if enabled else tk.DISABLED)
+        if len(tuner.trials) != before:
+            self._refresh_intensity_trial_table()
+
+    @staticmethod
+    def _tuning_ratio_text(value: Optional[float]) -> str:
+        return f"{value:.2f}x" if value is not None and np.isfinite(value) else "n/a"
+
+    def _refresh_intensity_trial_table(self) -> None:
+        tree = self._intensity_tuning_tree
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        for trial in self._intensity_tuner.trials:
+            stats = trial["stats"] or {}
+            comparison = trial["comparison"] or {}
+            state = "; ".join(trial["warnings"]) or ("Target reached" if comparison.get("target_reached") else "Measured")
+            tree.insert("", tk.END, values=(trial["kind"], trial["label"], f"{stats['span']:.2f}" if stats else "-", self._tuning_ratio_text(comparison.get("reduction")), self._tuning_ratio_text(comparison.get("relative_reduction")), state))
+
+    def _save_intensity_trials(self) -> None:
+        if not self._intensity_tuner.trials or self._intensity_tuner.active is not None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save interference trials", initialdir=str(Path.cwd()),
+            initialfile=f"interference_trials_{time.strftime('%Y%m%d-%H%M%S')}.json",
+            defaultextension=".json", filetypes=[("JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            self._write_json_atomic(Path(path), {
+                "schema_version": 1,
+                "metric": "reference P98-P2 / test P98-P2; normalized ratio also required for target",
+                "timestamp_basis": "host perf_counter at SDK buffer receipt; not sensor exposure timestamps",
+                "measurement": "native Mono12 ROI mean intensity; no background subtraction; no measurement thinning",
+                "interpretation": "Observed intensity modulation under manually confirmed comparable Z sweeps; not proof of optical cancellation",
+                "trials": self._intensity_tuner.trials,
+            })
+            self._intensity_tuning_status_var.set(f"Saved {len(self._intensity_tuner.trials)} trials: {Path(path).name}")
+        except Exception as exc:
+            self._show_error("Save tuning trials", str(exc))
+
+    def _intensity_diagnostic_settings(self) -> dict:
+        return json.loads(json.dumps({
+            "timing_readback": self._live_intensity_timing_snapshot,
+            "gains_readback": self._live_intensity_gains_snapshot,
+            "roi_readback": self._live_intensity_roi_snapshot,
+            "analysis_roi": self._live_intensity_roi_meta,
+            "frame_shape": self._live_intensity_frame_shape,
+            "background_requested": self._live_background_subtract_enabled,
+            "background_loaded": self._live_intensity_background is not None,
+            "background_crop_available": self._live_intensity_background_crop is not None,
+            "background_profile_path": str(self._background_profile_path) if self._background_profile_path is not None else None,
+            "camera_error": self._live_intensity_error,
+            "label_manual": self._intensity_tuning_label_var.get(),
+            "drive_note_manual": self._intensity_tuning_drive_var.get(),
+            "sound_on_manual": bool(self._sound_on_var.get()),
+        }))
+
+    def _begin_intensity_diagnostic(self) -> None:
+        if not self._live_intensity_running:
+            self._intensity_diagnostic_status_var.set("Start magnifier analysis first")
+            return
+        if self._intensity_diagnostic.active or not self._intensity_diagnostic_saved:
+            self._intensity_diagnostic_status_var.set("Stop or save the previous diagnostic first")
+            return
+        try:
+            duration = float(self._intensity_diagnostic_duration_var.get())
+            if not np.isfinite(duration) or not 10.0 <= duration <= 120.0:
+                raise ValueError("Diagnostic duration must be 10 to 120 seconds")
+            path = filedialog.asksaveasfilename(
+                parent=self._intensity_tuning_window, title="Record intensity diagnostic",
+                initialdir=str(Path.cwd()), initialfile=f"intensity_diagnostic_{time.strftime('%Y%m%d-%H%M%S')}.npz",
+                defaultextension=".npz", filetypes=[("NumPy diagnostic", "*.npz")],
+            )
+            if not path:
+                return
+            settings = self._intensity_diagnostic_settings()
+            settings["created_local"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._intensity_diagnostic.begin(time.perf_counter(), duration, settings)
+            self._intensity_diagnostic_path = Path(path)
+            self._intensity_diagnostic_saved = False
+            self._intensity_diagnostic_save_attempted = False
+            self._update_intensity_tuning()
+        except (ValueError, OSError) as exc:
+            self._intensity_diagnostic_status_var.set(f"Diagnostic start failed: {exc}")
+
+    def _mark_intensity_diagnostic(self, label: Optional[str] = None) -> None:
+        if not self._intensity_diagnostic.active:
+            return
+        self._intensity_diagnostic.mark(
+            time.perf_counter(), label if label is not None else self._intensity_tuning_label_var.get(),
+            self._intensity_diagnostic_settings(),
+        )
+
+    def _finish_intensity_diagnostic(self, reason: str = "manual_stop") -> None:
+        if not self._intensity_diagnostic.active:
+            return
+        self._mark_intensity_diagnostic(f"Stop: {reason}")
+        self._intensity_diagnostic.finish(time.perf_counter(), reason)
+        self._save_intensity_diagnostic()
+
+    def _save_intensity_diagnostic(self) -> None:
+        if self._intensity_diagnostic.active or self._intensity_diagnostic_path is None:
+            return
+        self._intensity_diagnostic_save_attempted = True
+        try:
+            self._intensity_diagnostic.save(self._intensity_diagnostic_path)
+            self._intensity_diagnostic_saved = True
+            self._intensity_diagnostic_status_var.set(
+                f"Saved {self._intensity_diagnostic.count} samples ({self._intensity_diagnostic.metadata.get('stop_reason')})\n{self._intensity_diagnostic_path}"
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            self._intensity_diagnostic_status_var.set(f"Save failed; diagnostic retained in memory: {exc}")
+            self._show_error("Diagnostic save failed", str(exc))
+
+    def _live_intensity_bounds(self, shape: tuple[int, int]) -> tuple[int, int, int]:
+        meta = self._live_intensity_roi_meta if isinstance(self._live_intensity_roi_meta, dict) else {}
+        win_raw = int(meta.get("win_raw", min(shape)))
+        win_raw = max(1, min(win_raw, int(shape[0]), int(shape[1])))
+        cx_rel = float(meta.get("cx", 0.5 * float(shape[1] - 1))) - float(meta.get("x", 0))
+        cy_rel = float(meta.get("cy", 0.5 * float(shape[0] - 1))) - float(meta.get("y", 0))
+        half = int(win_raw) // 2
+        x0 = int(round(cx_rel)) - half
+        y0 = int(round(cy_rel)) - half
+        x0 = max(0, min(int(shape[1]) - win_raw, x0))
+        y0 = max(0, min(int(shape[0]) - win_raw, y0))
+        return x0, y0, win_raw
 
     def _live_intensity_square_region(self, frame: np.ndarray) -> np.ndarray:
         arr = np.asarray(frame)
         if arr.ndim != 2 or arr.size == 0:
             return arr
-        meta = self._live_intensity_roi_meta if isinstance(self._live_intensity_roi_meta, dict) else {}
-        win_raw = int(meta.get("win_raw", min(arr.shape[0], arr.shape[1])))
-        win_raw = max(1, min(int(win_raw), int(arr.shape[0]), int(arr.shape[1])))
-        cx_rel = float(meta.get("cx", 0.5 * float(arr.shape[1] - 1))) - float(meta.get("x", 0))
-        cy_rel = float(meta.get("cy", 0.5 * float(arr.shape[0] - 1))) - float(meta.get("y", 0))
-        half = int(win_raw) // 2
-        x0 = int(round(cx_rel)) - half
-        y0 = int(round(cy_rel)) - half
-        x0 = max(0, min(int(arr.shape[1]) - int(win_raw), x0))
-        y0 = max(0, min(int(arr.shape[0]) - int(win_raw), y0))
-        return arr[y0 : y0 + int(win_raw), x0 : x0 + int(win_raw)]
+        x0, y0, win_raw = self._live_intensity_bounds(arr.shape)
+        return arr[y0:y0 + win_raw, x0:x0 + win_raw]
 
-    def _live_intensity_on_frame(self, arr_obj: object) -> None:
+    def _live_intensity_on_frame(self, arr_obj: object, received_at: Optional[float] = None) -> None:
         if not self._live_intensity_running:
             return
         try:
             frame16 = np.asarray(arr_obj, dtype=np.uint16, copy=False)
-            roi_meta = self._live_intensity_roi_meta
-            if bool(getattr(self, "_live_background_subtract_enabled", False)):
-                frame16 = self._subtract_background_frame(frame16, roi=roi_meta, base_dir=Path.cwd())
-            frame8 = (frame16 >> 4).astype(np.uint8, copy=False)
-            square8 = self._live_intensity_square_region(frame8)
-            val = float(np.mean(square8.astype(np.float64, copy=False))) if square8.size else float("nan")
+            roi_meta = self._live_intensity_roi_meta or {}
+            square = self._live_intensity_square_region(frame16)
+            raw_square = square
+            shape_changed = self._live_intensity_frame_shape != frame16.shape
+            self._live_intensity_frame_shape = frame16.shape
+            if shape_changed:
+                self._mark_intensity_diagnostic("Frame shape changed")
+            clipped = bool(square.size and (np.min(square) <= 0 or np.max(square) >= 4095)) if self._intensity_tuner.active is not None else False
+            profile = self._live_intensity_background
+            if self._live_background_subtract_enabled and profile is not None:
+                key = (frame16.shape, roi_meta.get("x"), roi_meta.get("y"), roi_meta.get("cx"), roi_meta.get("cy"), roi_meta.get("win_raw"))
+                if key != self._live_intensity_background_key:
+                    crop = self._crop_background_profile(frame16.shape, roi=roi_meta, profile=profile)
+                    self._live_intensity_background_crop = self._live_intensity_square_region(crop) if crop is not None else None
+                    self._live_intensity_background_key = key
+                background = self._live_intensity_background_crop
+                if background is not None:
+                    square = self._subtract_background_frame(square, profile=background)
+            val = float(np.mean(square, dtype=np.float64)) if square.size else float("nan")
+            now = time.perf_counter()
+            if received_at is None:
+                received_at = now
+                if self._intensity_diagnostic.active:
+                    self._intensity_diagnostic.metadata["receipt_timestamp_fallback_used"] = True
+            if self._intensity_diagnostic.active:
+                x0, y0, _ = self._live_intensity_bounds(frame16.shape)
+                origin = (int(roi_meta.get("x", 0)) + x0, int(roi_meta.get("y", 0)) + y0)
+                self._intensity_diagnostic.add(raw_square, val, float(received_at), now, self._live_intensity_frame_i, origin)
             if not np.isfinite(val):
                 return
-            fps = float(self._live_intensity_fps) if float(self._live_intensity_fps) > 0.0 else 1.0
-            t_s = float(self._live_intensity_frame_i) / fps
+            self._live_intensity_last_received_at = float(received_at)
+            self._live_intensity_frame_age = max(0.0, now - float(received_at))
+            self._intensity_tuner.add(val, float(received_at), now, clipped=clipped)
+            if self._live_intensity_started_at is None:
+                self._live_intensity_started_at = float(received_at)
+            t_s = float(received_at) - self._live_intensity_started_at
             self._live_intensity_frame_i += 1
             cutoff = t_s - float(self._live_intensity_window_s)
             with self._live_intensity_lock:
                 self._live_intensity_buffer.append((t_s, val))
                 while self._live_intensity_buffer and float(self._live_intensity_buffer[0][0]) < cutoff:
                     self._live_intensity_buffer.popleft()
-            now = time.perf_counter()
             if (now - float(self._live_intensity_last_preview_ts)) >= float(
                 self._live_intensity_preview_interval_s
             ):
                 self._live_intensity_last_preview_ts = now
-                preview = np.array(square8, copy=True)
+                preview = (square >> 4).astype(np.uint8)
                 try:
                     self._live_intensity_preview_queue.put_nowait(preview)
                 except queue.Full:
@@ -4919,7 +5474,8 @@ class BasicVideoPlayer:
                         self._live_intensity_preview_queue.put_nowait(preview)
                     except queue.Full:
                         pass
-        except Exception:
+        except Exception as exc:
+            self._mark_intensity_diagnostic(f"Frame callback error: {type(exc).__name__}: {exc}")
             return
 
     def _live_update_intensity_preview(self, frame8: np.ndarray) -> None:
@@ -4951,6 +5507,8 @@ class BasicVideoPlayer:
                 self._live_intensity_app.processEvents()
         except Exception:
             pass
+        if not self._live_intensity_running:
+            return
         preview = None
         try:
             while True:
@@ -4962,6 +5520,7 @@ class BasicVideoPlayer:
         now = time.perf_counter()
         if (now - float(self._live_intensity_last_plot_ts)) >= float(self._live_intensity_plot_interval_s):
             self._live_intensity_last_plot_ts = now
+            self._update_intensity_tuning()
             self._live_render_intensity_plot(force=False)
         self._live_intensity_after_id = self.root.after(5, self._live_intensity_tick)
 
@@ -4981,24 +5540,31 @@ class BasicVideoPlayer:
                 t = np.asarray([p[0] for p in data], dtype=np.float64)
                 y = np.asarray([p[1] for p in data], dtype=np.float64)
                 if Figure is not None and FigureCanvas is not None:
-                    fig = Figure(figsize=(3.0, 1.7), dpi=100)
-                    ax = fig.add_subplot(111)
-                    x = t - float(t[-1])
-                    ax.plot(x, y, color="#0b4f8a", lw=0.9)
-                    ax.set_xlim(-float(self._live_intensity_window_s), 0.0)
+                    if self._live_intensity_figure is None:
+                        self._live_intensity_figure = Figure(figsize=(3.0, 1.7), dpi=100)
+                        self._live_intensity_canvas = FigureCanvas(self._live_intensity_figure)
+                        self._live_intensity_axis = self._live_intensity_figure.add_subplot(111)
+                        self._live_intensity_line, = self._live_intensity_axis.plot([], [], color="#0b4f8a", lw=0.9)
+                        self._live_intensity_axis.set_xlim(-float(self._live_intensity_window_s), 0.0)
+                        self._live_intensity_axis.set_xlabel("Time from now (s)", fontsize=7)
+                        self._live_intensity_axis.set_ylabel("Mean intensity (DN)", fontsize=7)
+                        self._live_intensity_axis.set_title("Live intensity, last 10 s", fontsize=8)
+                        self._live_intensity_axis.tick_params(labelsize=7)
+                        self._live_intensity_axis.grid(alpha=0.25)
+                        self._live_intensity_figure.subplots_adjust(left=0.21, bottom=0.26, right=0.96, top=0.83)
+                    ax = self._live_intensity_axis
+                    self._live_intensity_line.set_data(*display_envelope(t - float(t[-1]), y, columns=300))
                     ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
+                    if self._intensity_tuner.reference is not None:
+                        reference_stats = self._intensity_tuner.reference["stats"]
+                        ymin, ymax = reference_stats["p02"], reference_stats["p98"]
                     if ymax <= ymin:
                         ymin -= 1.0
                         ymax += 1.0
                     pad = 0.08 * max(1.0, ymax - ymin)
                     ax.set_ylim(ymin - pad, ymax + pad)
-                    ax.set_xlabel("Time from now (s)", fontsize=7)
-                    ax.set_ylabel("Mean intensity", fontsize=7)
-                    ax.set_title("Live intensity, last 10 s", fontsize=8)
-                    ax.tick_params(labelsize=7)
-                    ax.grid(alpha=0.25)
-                    fig.tight_layout(pad=0.45)
-                    img = self._mpl_fig_to_image(fig)
+                    self._live_intensity_canvas.draw()
+                    img = Image.fromarray(np.asarray(self._live_intensity_canvas.buffer_rgba()).copy())
                 else:
                     img = Image.new("RGB", (width, height), "white")
                     draw = ImageDraw.Draw(img)
@@ -5022,7 +5588,7 @@ class BasicVideoPlayer:
                     p2, p98 = np.percentile(y, [2, 98])
                     fps = float(self._live_intensity_fps) if self._live_intensity_fps else 0.0
                     self._live_intensity_status_var.set(
-                        f"{len(y)} samples | fps {fps:.1f} | p98-p2 {float(p98 - p2):.2f} counts"
+                        f"{len(y)} samples | fps {fps:.1f} | p98-p2 {float(p98 - p2):.2f} DN"
                     )
             photo = ImageTk.PhotoImage(img)
             self._live_intensity_plot_label.configure(image=photo)
@@ -5263,8 +5829,8 @@ class BasicVideoPlayer:
         except Exception:
             self._live_zoom_center_var.set("Centre pixel: -")
 
-    def _start_live_feed(self) -> None:
-        if self._live_running:
+    def _start_live_feed(self, *, preserve_zoom: bool = False) -> None:
+        if self._live_running or self._live_intensity_running:
             return
         try:
             from PySide6.QtWidgets import QApplication
@@ -5282,7 +5848,8 @@ class BasicVideoPlayer:
             gain = 0.0
 
         self._reset_live_tracking(keep_shift=False)
-        self._sync_live_zoom_center_to_selected_spot(reset_xy=True)
+        if not preserve_zoom:
+            self._sync_live_zoom_center_to_selected_spot(reset_xy=True)
         self._live_app = QApplication.instance() or QApplication([])
         self._live_queue = queue.Queue(maxsize=2)
         self._live_controller = Controller()
@@ -6820,6 +7387,7 @@ class BasicVideoPlayer:
         s_map_full: np.ndarray,
         s_map_int: np.ndarray,
         centers_full: list[tuple[float, float]],
+        seed_frames: bool = True,
     ) -> None:
         # Sort spots by S value (descending) so "Spot 1" is the strongest candidate.
         if s_map_int is not None and centers_full:
@@ -6879,10 +7447,10 @@ class BasicVideoPlayer:
 
         seed_kind = None
         seed_count = 0
-        if centers_full and gray_frames:
+        if seed_frames and centers_full and gray_frames:
             seed_kind = "list"
             seed_count = len(gray_frames)
-        elif centers_full and (self.source_kind == "npy") and self.npy_frames is not None and self.npy_has_frames_dim:
+        elif seed_frames and centers_full and (self.source_kind == "npy") and self.npy_frames is not None and self.npy_has_frames_dim:
             seed_kind = "npy"
             seed_count = int(min(int(self._st2_frames), int(self.frame_count)))
 
@@ -6926,7 +7494,8 @@ class BasicVideoPlayer:
                 self._xy_frames_processed = used
                 self._phi_frames_processed = used
 
-        self._sort_spots_by_xy_range()
+        if self._analysis_detection_mode != "Intensity":
+            self._sort_spots_by_xy_range()
         # Refresh the overview image + overlay on the UI thread.
         self._ui_call(self._set_smap_background)
         self._ui_call(self._rebuild_smap_overlay)
@@ -7573,6 +8142,12 @@ class BasicVideoPlayer:
         self._spot_window_cache_size = None
         self._spot_view_cache = []
 
+        if self._detection_mode_var.get() == "Intensity" or self._analysis_detection_mode == "Intensity":
+            path = self.video_path
+            if path and self._close_video():
+                self._load_source(path)
+            return
+
         if self._s_map is None:
             messagebox.showinfo("Spot analysis", "S_map is not ready yet.")
             return
@@ -7686,6 +8261,10 @@ class BasicVideoPlayer:
         if self._spot_view_cache and len(self._spot_view_cache) == n:
             cache_entry = self._spot_view_cache[self._spot_idx]
         fps_key = round(float(plot_fps), 6) if plot_fps and plot_fps > 0.0 else 0.0
+        if self._analysis_detection_mode == "Intensity":
+            self._render_intensity_spot_series(xy_series, phi_series, plot_fps)
+            self._spot_status_var.set(f"Spot {self._spot_idx + 1} / {n}")
+            return
         phi_len = len(phi_series)
         fft_img = None
         if (
@@ -8179,6 +8758,10 @@ class BasicVideoPlayer:
             self.bottom_var.set("")
             return
         self._analysis_finished = True
+        if self._analysis_detection_mode == "Intensity":
+            self._auto_inspect_chk.state(["disabled"])
+            self.bottom_var.set(f"Intensity analysis complete: {len(self._spot_centers)} spots, {self.proc_done} frames")
+            return
         if self._auto_inspect_chk is not None:
             self._auto_inspect_chk.state(["!disabled"])
         if bool(getattr(self, "_auto_inspect_enabled", False)):
@@ -8241,6 +8824,8 @@ class BasicVideoPlayer:
         self.npy_has_frames_dim = False
         self.source_kind = "avi"
         self.video_path = path
+        self._source_recording_metadata = read_recording_metadata(Path(path))
+        self._source_phase = {}
 
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 0.0
@@ -8307,9 +8892,10 @@ class BasicVideoPlayer:
             frame_count = int(arr.shape[0])
             has_frames_dim = True
 
+        phase_meta = {}
         if has_frames_dim:
             try:
-                arr = strip_phase_marker(arr, marker_appended=recording_phase_marker(metadata))
+                arr = strip_phase_marker(arr, marker_appended=recording_phase_marker(metadata), roi_meta=phase_meta)
             except ValueError as exc:
                 messagebox.showerror("Error", str(exc))
                 return False
@@ -8342,11 +8928,21 @@ class BasicVideoPlayer:
         self.video_path = path
         self.frame_count = frame_count
         self.source_fps = float(fps)
+        self._source_recording_metadata = metadata
+        self._source_phase = phase_meta
 
         self._start_after_load(gray0)
         return True
 
     def _start_after_load(self, gray0: np.ndarray) -> None:
+        self._analysis_detection_mode = self._detection_mode_var.get()
+        for widget in (self._ring_score_entry, self._motion_range_checkbox):
+            widget.state(["disabled"] if self._analysis_detection_mode == "Intensity" else ["!disabled"])
+        self._intensity_channels = None
+        self._intensity_mean_frame = None
+        if self._intensity_distribution_window is not None:
+            self._intensity_distribution_window.destroy()
+            self._intensity_distribution_window = None
         self._show_finished(False)
         self._analysis_finished = False
 
@@ -8448,7 +9044,7 @@ class BasicVideoPlayer:
                 if not ok or frame is None:
                     break
 
-                gray = _to_gray_u8(frame)
+                gray = self._analysis_frame(frame)
                 if gray is None:
                     break
                 gray = self._apply_flat_field(gray, base_dir=Path(self.video_path).parent if self.video_path else None)
@@ -8467,6 +9063,9 @@ class BasicVideoPlayer:
                         break
                     except queue.Full:
                         continue
+        except Exception as exc:
+            self.stop_event.set()
+            self._ui_call(self._show_error, "Frame decoding", str(exc))
         finally:
             self.decode_done = True
 
@@ -8483,7 +9082,7 @@ class BasicVideoPlayer:
                     if self.stop_event.is_set():
                         break
                     frame = self.npy_frames[i]
-                    gray = _to_gray_u8(frame)
+                    gray = self._analysis_frame(frame)
                     if gray is None:
                         break
                     gray = self._apply_flat_field(
@@ -8507,7 +9106,7 @@ class BasicVideoPlayer:
                             continue
             else:
                 if not self.stop_event.is_set():
-                    gray = _to_gray_u8(self.npy_frames)
+                    gray = self._analysis_frame(self.npy_frames)
                     if gray is not None:
                         gray = self._apply_flat_field(
                             gray, base_dir=Path(self.video_path).parent if self.video_path else None
@@ -8528,10 +9127,257 @@ class BasicVideoPlayer:
                                 break
                             except queue.Full:
                                 continue
+        except Exception as exc:
+            self.stop_event.set()
+            self._ui_call(self._show_error, "Frame decoding", str(exc))
         finally:
             self.decode_done = True
 
+    def _render_intensity_spot_series(self, xy_series, phi_series, fps):
+        if Figure is None or FigureCanvas is None:
+            return
+        xy = np.asarray(xy_series, dtype=float).reshape(-1, 2)
+        phi = np.asarray(phi_series, dtype=float)
+        rate = float(fps) if fps and fps > 0 else 1.0
+        for kind, label, reference in (("xy", self._xy_img_label, "_xy_img_ref"),
+                                       ("phi", self._phi_img_label, "_phi_img_ref"),
+                                       ("fft", self._fft_img_label, "_fft_img_ref")):
+            figure = Figure(figsize=(3.3, 2.0), dpi=100)
+            axis = figure.add_subplot(111)
+            if kind == "xy":
+                axis.scatter(xy[:, 0], xy[:, 1], s=3)
+                axis.set(xlabel="X", ylabel="Y", xlim=(-1, 1), ylim=(-1, 1))
+            elif kind == "phi":
+                axis.plot(np.arange(len(phi))/rate, np.degrees(phi), linewidth=.7)
+                axis.set(xlabel="Time (s)", ylabel="Phi (deg)", ylim=(0, 180))
+            else:
+                if len(phi) > 1 and np.isfinite(phi).all():
+                    continuous = np.unwrap(2*phi)/2
+                    axis.plot(np.fft.rfftfreq(len(phi), 1/rate),
+                              np.abs(np.fft.rfft(continuous-continuous.mean())), linewidth=.7)
+                else:
+                    axis.text(.5, .5, "No continuous valid trace", ha="center", transform=axis.transAxes, fontsize=8)
+                axis.set(xlabel="Frequency (Hz)", ylabel="Phi amplitude")
+            figure.tight_layout(pad=.7)
+            canvas = FigureCanvas(figure)
+            canvas.draw()
+            image = ImageTk.PhotoImage(Image.fromarray(np.asarray(canvas.buffer_rgba()).copy()))
+            label.configure(image=image)
+            setattr(self, reference, image)
+
+    def _intensity_distribution_data(self):
+        if self._analysis_detection_mode != "Intensity" or not self._analysis_finished or self._intensity_channels is None:
+            raise ValueError("Complete an intensity analysis first.")
+        if self._intensity_channels.shape[1] == 0:
+            raise ValueError("No intensity spots detected. Adjust DoG k and update analysis.")
+        text = self._intensity_window_var.get().strip()
+        window = None if text.lower() == "all" else int(text)
+        if window is not None and window < 1:
+            raise ValueError("Frames / average must be All or a positive integer.")
+        frame_count, spot_count, _ = self._intensity_channels.shape
+        if ((frame_count-1)//(window or frame_count)+1)*spot_count > 100_000:
+            raise ValueError("More than 100,000 averages requested. Increase frames / average.")
+        method = self._intensity_average_var.get()
+        model = self._intensity_medium_var.get()
+        if model not in self.THETA_RECON_MODELS:
+            raise ValueError("Choose a listed theta model.")
+        result = intensity_spots.average_directions(self._intensity_channels, self._theta_recon_lut(model), method, window)
+        density, x_edges, y_edges = intensity_spots.projected_density(result["projected"])
+        result.update(density=density, density_x_edges=x_edges, density_y_edges=y_edges)
+        metadata = {
+            "schema_version": 1, "source_stack": str(Path(self.video_path).resolve()),
+            "source_metadata": self._source_recording_metadata, "fps": self.source_fps,
+            "detector": "DoG on full-stack mean of four-polarizer cell intensity",
+            "dog_k": self._dog_k_std, "dog_sigma_small": detect_spinners.DOG_SIGMA_SMALL,
+            "dog_sigma_large": detect_spinners.DOG_SIGMA_LARGE,
+            "dog_min_area": self._spot_min_area, "dog_max_area": self._spot_max_area,
+            "spot_window_raw_pixels": max(2, self._spot_window_size//2*2),
+            "channel_order": ["I0", "I90", "I45", "I135"],
+            "channel_values": "Mean saved DN; no additional background subtraction or display stretching",
+            "sensor_origin": list(self._intensity_origin), "origin_source": self._intensity_origin_source,
+            "averaging": method, "window_frames": window or frame_count, "partial_last_window": "included",
+            "theta_model_key": model, "theta_model": dict(self.THETA_RECON_MODELS[model]),
+            "calibration_status": "Existing theoretical finite-NA model; not validated for this sample",
+            "orientation_convention": "theta 0..90 deg; continuous doubled-azimuth branch before Cartesian averaging; final phi folded modulo 180 deg",
+            "ambiguity": "No unique 3D polarity/tilt-sign recovery; continuity assumes no unresolved azimuth jumps above 90 deg between valid samples",
+            "projection": "(nx,ny)/(1+nz), folded upper half disk",
+            "density_measure": "Probability per projected-plane area; equal weight per valid rod/window, not solid-angle density",
+            "invalid_policy": "Nonfinite/negative channels or nonpositive pair sums excluded; out-of-model reconstructed radii and vanishing Cartesian resultants not projected",
+            "valid_averages": int(np.isfinite(result["projected"]).all(axis=-1).sum()),
+            "total_averages": int(np.prod(result["projected"].shape[:2])),
+        }
+        return result, metadata
+
+    def _save_intensity_distribution(self, result, metadata):
+        selected = filedialog.asksaveasfilename(parent=self._intensity_distribution_window or self.root,
+            title="Save intensity orientation analysis", defaultextension=".npz", filetypes=[("NumPy archive", "*.npz")],
+            initialfile=f"{Path(metadata['source_stack']).stem}_intensity_analysis.npz")
+        if not selected:
+            return
+        path = Path(selected)
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with temporary.open("wb") as output:
+                np.savez(output, **result, channels=self._intensity_channels,
+                         centers=np.asarray(self._spot_centers_all), bounds=np.asarray(self._spot_bounds_int_all),
+                         mean_frame=self._intensity_mean_frame,
+                         metadata_json=np.asarray(json.dumps(metadata, allow_nan=False)))
+            temporary.replace(path)
+            self.bottom_var.set(f"Saved intensity analysis: {path}")
+        except Exception as exc:
+            self._show_error("Save intensity analysis", str(exc))
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def _open_intensity_distribution(self):
+        try:
+            result, metadata = self._intensity_distribution_data()
+            if Figure is None or FigureCanvas is None:
+                raise ValueError("Matplotlib is required for the distribution view.")
+        except (ValueError, TypeError) as exc:
+            self._show_error("Intensity orientation", str(exc))
+            return
+        if self._intensity_distribution_window is not None:
+            self._intensity_distribution_window.destroy()
+        popup = tk.Toplevel(self.root)
+        self._intensity_distribution_window = popup
+        popup.title(f"Intensity orientation: {Path(self.video_path).name}")
+        popup.geometry("1040x640")
+        popup.minsize(860, 540)
+        def close():
+            popup.destroy()
+            self._intensity_distribution_window = None
+        popup.protocol("WM_DELETE_WINDOW", close)
+        toolbar = ttk.Frame(popup, padding=8)
+        toolbar.pack(fill=tk.X)
+        ttk.Button(toolbar, text="Save analysis", command=lambda: self._save_intensity_distribution(result, metadata)).pack(side=tk.LEFT)
+        ttk.Label(toolbar, text=f"{len(self._spot_centers_all)} rods | {metadata['valid_averages']}/{metadata['total_averages']} valid averages | {metadata['averaging']}").pack(side=tk.LEFT, padx=12)
+        ttk.Label(popup, text=f"{self.THETA_RECON_MODELS[metadata['theta_model_key']]['label']} | {metadata['window_frames']} frames / average | phi mod 180 deg, +z representative",
+                  padding=(8, 0, 8, 4)).pack(anchor="w")
+        source = next((entry for entry in self._source_recording_metadata if "conditions" in entry), {})
+        condition = source.get("conditions", {})
+        background = source.get("background", {}).get("background_subtracted", "Unknown")
+        ttk.Label(popup, text=f"{condition.get('recording_role', 'Unknown recording')} | Interference drive: {condition.get('interference_drive', 'Unknown')} | Saved background subtraction: {background}",
+                  padding=(8, 0, 8, 4)).pack(anchor="w")
+        figure = Figure(figsize=(10, 4.5), dpi=110)
+        sphere = figure.add_subplot(131, projection="3d")
+        scatter = figure.add_subplot(132)
+        density_axis = figure.add_subplot(133)
+        azimuth, polar = np.meshgrid(np.linspace(0, np.pi, 19), np.linspace(0, np.pi/2, 10))
+        sphere.plot_wireframe(np.sin(polar)*np.cos(azimuth), np.sin(polar)*np.sin(azimuth), np.cos(polar),
+                              color="0.8", linewidth=.4)
+        directions = result["directions"].reshape(-1, 3)
+        valid = np.isfinite(directions).all(axis=1)
+        sphere.scatter(*directions[valid].T, s=9, color="#167c65")
+        sphere.set(xlabel="nx", ylabel="ny", zlabel="nz", title="Unit sphere", xlim=(-1, 1), ylim=(0, 1), zlim=(0, 1))
+        sphere.set_box_aspect((2, 1, 1))
+        points = result["projected"].reshape(-1, 2)
+        scatter.scatter(points[:, 0], points[:, 1], s=10, alpha=.65, color="#167c65")
+        scatter.set_title("Stereographic projection")
+        image = density_axis.imshow(result["density"].T, origin="lower", extent=(-1, 1, 0, 1), interpolation="nearest", cmap="viridis")
+        density_axis.set_title("Projected density")
+        figure.colorbar(image, ax=density_axis, orientation="horizontal", pad=.2, label="Probability / projected area")
+        arc = np.linspace(0, np.pi, 181)
+        for axis in (scatter, density_axis):
+            axis.plot(np.cos(arc), np.sin(arc), color="0.4", linewidth=.7)
+            axis.set(xlabel="nx / (1+nz)", ylabel="ny / (1+nz)", xlim=(-1, 1), ylim=(0, 1))
+            axis.set_aspect("equal")
+        figure.tight_layout(pad=1.5)
+        canvas = FigureCanvas(figure)
+        canvas.draw()
+        original = Image.fromarray(np.asarray(canvas.buffer_rgba()).copy())
+        label = ttk.Label(popup)
+        label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        def resize(event):
+            resized = original.copy()
+            resized.thumbnail((max(1, event.width), max(1, event.height)), Image.Resampling.LANCZOS)
+            self._intensity_distribution_image = ImageTk.PhotoImage(resized)
+            label.configure(image=self._intensity_distribution_image)
+        label.bind("<Configure>", resize)
+
+    def _analysis_frame(self, frame):
+        if self._analysis_detection_mode != "Intensity":
+            return _to_gray_u8(frame)
+        values = np.asarray(frame)
+        if values.ndim == 3 and values.shape[-1] == 1:
+            values = values[..., 0]
+        elif values.ndim == 3 and values.shape[-1] in (3, 4):
+            values = cv2.cvtColor(values, cv2.COLOR_BGRA2GRAY if values.shape[-1] == 4 else cv2.COLOR_BGR2GRAY)
+        if values.ndim != 2 or not np.issubdtype(values.dtype, np.number):
+            raise ValueError("Intensity analysis requires numeric grayscale polarization frames.")
+        return values
+
+    def _recorded_intensity_origin(self):
+        for payload in self._source_recording_metadata:
+            roi = payload.get("roi") or payload.get("roi_meta") or {}
+            for x_key, y_key in (("OffsetX", "OffsetY"), ("x", "y"), ("phase_x", "phase_y")):
+                if x_key in roi and y_key in roi:
+                    return (int(roi[x_key]), int(roi[y_key])), "recording_metadata"
+        if self._source_phase:
+            return (self._source_phase["phase_x"], self._source_phase["phase_y"]), "phase_marker"
+        return (0, 0), "assumed_full_frame"
+
+    def _intensity_recon_worker(self, shape):
+        total = np.zeros(shape, dtype=np.float64)
+        processed = 0
+        try:
+            while not self.stop_event.is_set():
+                if self.decode_done and self.frame_q.empty():
+                    break
+                try:
+                    frame = self.frame_q.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                total += frame
+                processed += 1
+                self.proc_done = processed
+            if self.stop_event.is_set() or not processed:
+                return
+            mean = total / processed
+            detection_map = detect_spinners.intensity_detection_map(mean)
+            centers = self._find_centers_on_s_map(detection_map)
+            if processed * len(centers) * 4 * 8 > 256 * 1024**2:
+                raise ValueError("Spot traces exceed 256 MiB. Increase DoG threshold or use a shorter stack.")
+            self._init_spot_analysis(detection_map, detection_map, centers, seed_frames=False)
+            self._update_spot_bounds_intensity(shape)
+            origin, origin_source = self._recorded_intensity_origin()
+            channels = np.empty((processed, len(self._spot_centers_all), 4), dtype=np.float64)
+            with self._gray_lock:
+                cached = list(self._gray_frames)
+            for frame_index in range(processed):
+                if self.stop_event.is_set():
+                    return
+                if self.source_kind == "npy":
+                    frame = self.npy_frames[frame_index] if self.npy_has_frames_dim else self.npy_frames
+                    frame = self._analysis_frame(frame)
+                else:
+                    frame = cached[frame_index]
+                channels[frame_index] = intensity_spots.channel_means(frame, self._spot_bounds_int_all, origin)
+            xy = intensity_spots.anisotropy(channels)
+            with self._analysis_lock:
+                self._spot_xy_series_all = [list(map(tuple, xy[:, index])) for index in range(len(centers))]
+                self._spot_phi_series_all = [np.mod(.5*np.arctan2(xy[:, index, 1], xy[:, index, 0]), np.pi).tolist()
+                                            for index in range(len(centers))]
+                self._spot_xy_series = list(self._spot_xy_series_all)
+                self._spot_phi_series = list(self._spot_phi_series_all)
+                self._xy_frames_processed = processed
+                self._phi_frames_processed = processed
+            self._intensity_channels = channels
+            self._intensity_mean_frame = mean
+            self._intensity_origin = origin
+            self._intensity_origin_source = origin_source
+            self._st_popup_done = True
+            self._ui_call(self._update_spot_view)
+            self._ui_call(self._show_finished, True)
+        except Exception as exc:
+            self.stop_event.set()
+            self._ui_call(self._show_error, "Intensity analysis", str(exc))
+
     def _recon_worker(self, shape: tuple[int, int]):
+        if getattr(self, "_analysis_detection_mode", "Time variation") == "Intensity":
+            self._intensity_recon_worker(shape)
+            return
         # For the initial S-map, track per-pixel *unnormalised* anisotropy ranges
         # over the first N frames in full-resolution intersection space.
         qu_recon = make_qu_reconstructor(shape, out_dtype=np.float32)
@@ -8823,7 +9669,14 @@ class BasicVideoPlayer:
         self._stop_live_feed()
         self._stop_spotrec()
         self._stop_spotrec_preview_loop()
+        if not getattr(self, "_intensity_diagnostic_saved", True):
+            self._show_error("Unsaved diagnostic", "The diagnostic is still in memory. Resolve the save error and use Retry save in Interference tuning before closing.")
+            return
         if self._close_video():
+            pump_id = getattr(self, "_ui_pump_after_id", None)
+            if pump_id is not None:
+                self.root.after_cancel(pump_id)
+                self._ui_pump_after_id = None
             self.root.destroy()
 
         

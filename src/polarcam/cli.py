@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import subprocess
 import sys
+
+
+def _tk_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    if sys.platform != "win32":
+        return environment
+    import _tkinter
+
+    library_root = Path(sys.base_prefix) / "tcl"
+    for variable, library, version, marker in (
+        ("TCL_LIBRARY", "tcl", _tkinter.TCL_VERSION, "init.tcl"),
+        ("TK_LIBRARY", "tk", _tkinter.TK_VERSION, "tk.tcl"),
+    ):
+        directory = library_root / f"{library}{version}"
+        if (directory / marker).is_file():
+            environment.setdefault(variable, str(directory))
+    return environment
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         [sys.executable, str(application)],
         cwd=data_dir,
         check=False,
+        env=_tk_environment(),
     )
     return result.returncode
 

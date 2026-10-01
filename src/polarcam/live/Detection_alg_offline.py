@@ -47,6 +47,17 @@ DOG_MAX_AREA: int = 250
 DOG_CONNECTIVITY: int = 8
 
 
+def intensity_detection_map(mean_frame: np.ndarray) -> np.ndarray:
+    frame = np.asarray(mean_frame, dtype=np.float64)
+    if frame.ndim != 2 or min(frame.shape) < 2 or any(size % 2 for size in frame.shape):
+        raise ValueError("Intensity detection requires an even-sized 2D polarization frame.")
+    if not np.isfinite(frame).all():
+        raise ValueError("Intensity detection requires finite pixels.")
+    cells = (frame[0::2, 0::2] + frame[0::2, 1::2]
+             + frame[1::2, 0::2] + frame[1::2, 1::2]) / 4.0
+    return np.repeat(np.repeat(cells, 2, axis=0), 2, axis=1).astype(np.float32)
+
+
 def to_u8_preview(
     img: np.ndarray, lo_pct: float = 10.0, hi_pct: float = 100.0
 ) -> np.ndarray:

@@ -17,6 +17,7 @@ class ICamera(QObject):
     stopped = Signal()
     closed = Signal()
     frame = Signal(object)  # numpy ndarray (H, W) uint16
+    frame_timed = Signal(object, float)
     error = Signal(str)
 
     # State snapshots
