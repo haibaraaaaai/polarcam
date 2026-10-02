@@ -41,7 +41,7 @@ except Exception:  # pragma: no cover
 import Detection_alg_offline as detect_spinners
 from pol_reconstruction import make_qu_reconstructor
 from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
-from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope
+from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope, roi_channel_means
 from polarcam.live import intensity_spots
 
 
@@ -5056,11 +5056,11 @@ class BasicVideoPlayer:
             return
         window = tk.Toplevel(self.root)
         window.title("Interference tuning")
-        window.geometry("800x690")
-        window.minsize(730, 640)
+        window.geometry("800x920")
+        window.minsize(730, 860)
         self._intensity_tuning_window = window
         window.columnconfigure(0, weight=1)
-        window.rowconfigure(7, weight=1)
+        window.rowconfigure(8, weight=1)
         fields = ttk.Frame(window, padding=10)
         fields.grid(row=0, column=0, sticky="ew")
         fields.columnconfigure(1, weight=1)
@@ -5094,8 +5094,15 @@ class BasicVideoPlayer:
         for variable in (self._intensity_tuning_status_var, self._intensity_tuning_reference_var, self._intensity_tuning_best_var):
             ttk.Label(result, textvariable=variable, wraplength=710, justify=tk.LEFT).pack(side=tk.TOP, anchor="w", pady=3)
         ttk.Label(window, textvariable=self._intensity_tuning_settings_var, wraplength=710, justify=tk.LEFT).grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 8))
+        xy_frame = ttk.LabelFrame(window, text="Residual XY locus (detrended: reference grey, latest trial colour)", padding=6)
+        xy_frame.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
+        xy_frame.columnconfigure(0, weight=1)
+        self._intensity_xy_label = ttk.Label(xy_frame, anchor="center")
+        self._intensity_xy_label.grid(row=0, column=0, sticky="ew")
+        self._intensity_xy_image_ref = None
+        self._intensity_xy_last_trial_key = None
         diagnostics = ttk.LabelFrame(window, text="Intensity diagnostic", padding=8)
-        diagnostics.grid(row=6, column=0, sticky="ew", padx=10, pady=(0, 8))
+        diagnostics.grid(row=7, column=0, sticky="ew", padx=10, pady=(0, 8))
         ttk.Label(diagnostics, text="Duration (s)").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(diagnostics, from_=10, to=120, textvariable=self._intensity_diagnostic_duration_var, width=5).grid(row=0, column=1, padx=6)
         for column, (key, text, command) in enumerate((
@@ -5109,10 +5116,10 @@ class BasicVideoPlayer:
             self._intensity_tuning_buttons[key] = button
         ttk.Label(diagnostics, textvariable=self._intensity_diagnostic_status_var, wraplength=670, justify=tk.LEFT).grid(row=1, column=0, columnspan=6, sticky="w", pady=(8, 0))
         table = ttk.Frame(window, padding=(10, 0, 10, 10))
-        table.grid(row=7, column=0, sticky="nsew")
-        columns = ("kind", "label", "span", "ratio", "relative", "state")
+        table.grid(row=8, column=0, sticky="nsew")
+        columns = ("kind", "label", "span", "ratio", "relative", "xy_extent", "xy_ratio", "state")
         tree = ttk.Treeview(table, columns=columns, show="headings", height=8)
-        for key, title, width in zip(columns, ("Type", "Trial", "Span (DN)", "Reduction", "Normalized", "Result"), (70, 120, 90, 90, 90, 200)):
+        for key, title, width in zip(columns, ("Type", "Trial", "Span (DN)", "Reduction", "Normalized", "XY extent", "XY red.", "Result"), (60, 110, 75, 75, 75, 70, 60, 180)):
             tree.heading(key, text=title)
             tree.column(key, width=width, minwidth=55)
         scrollbar = ttk.Scrollbar(table, orient=tk.VERTICAL, command=tree.yview)
@@ -5244,11 +5251,15 @@ class BasicVideoPlayer:
             comparison = result["comparison"]
             if comparison is not None:
                 parts.append(f"{self._tuning_ratio_text(comparison['reduction'])} reduction; {self._tuning_ratio_text(comparison['relative_reduction'])} normalized")
+                if comparison.get("extent_reduction") is not None:
+                    parts.append(f"{self._tuning_ratio_text(comparison['extent_reduction'])} XY reduction")
                 if comparison["target_reached"]:
                     parts.append(f">= {result['target']:g}x observed target")
             if result["warnings"]:
                 parts.append("; ".join(result["warnings"]))
             self._intensity_tuning_status_var.set(" | ".join(parts))
+            if result["complete"]:
+                self._update_intensity_xy_plot(result)
         reference = tuner.reference
         self._intensity_tuning_reference_var.set(
             f"Reference: {reference['label']} | span {reference['stats']['span']:.2f} DN | mean {reference['stats']['mean']:.1f} DN"
@@ -5291,8 +5302,88 @@ class BasicVideoPlayer:
         for trial in self._intensity_tuner.trials:
             stats = trial["stats"] or {}
             comparison = trial["comparison"] or {}
+            xy = trial.get("xy") or {}
             state = "; ".join(trial["warnings"]) or ("Target reached" if comparison.get("target_reached") else "Measured")
-            tree.insert("", tk.END, values=(trial["kind"], trial["label"], f"{stats['span']:.2f}" if stats else "-", self._tuning_ratio_text(comparison.get("reduction")), self._tuning_ratio_text(comparison.get("relative_reduction")), state))
+            tree.insert("", tk.END, values=(
+                trial["kind"], trial["label"], f"{stats['span']:.2f}" if stats else "-",
+                self._tuning_ratio_text(comparison.get("reduction")),
+                self._tuning_ratio_text(comparison.get("relative_reduction")),
+                f"{xy['extent']:.4f}" if xy.get("extent") else "-",
+                self._tuning_ratio_text(comparison.get("extent_reduction")),
+                state,
+            ))
+
+    def _update_intensity_xy_plot(self, result: dict) -> None:
+        """Render the detrended residual locus of the latest trial plus the
+        per-trial extent summary, following the offscreen Agg -> PIL pattern."""
+        label = getattr(self, "_intensity_xy_label", None)
+        if label is None or not label.winfo_exists():
+            return
+        key = (result["id"], result["kind"], result["label"])
+        if key == self._intensity_xy_last_trial_key:
+            return
+        self._intensity_xy_last_trial_key = key
+        if Figure is None or FigureCanvas is None:
+            return
+        reference = self._intensity_tuner.reference
+        trials = self._intensity_tuner.trials
+        fig = Figure(figsize=(7.0, 2.1), dpi=100)
+        FigureCanvas(fig)
+        axis_xy = fig.add_subplot(1, 2, 1)
+        axis_bar = fig.add_subplot(1, 2, 2)
+        plotted = False
+        if reference is not None and reference.get("xy"):
+            xy = reference["xy"]
+            axis_xy.plot(xy["plot_ax"], xy["plot_ay"], ".", ms=1, color="0.62", alpha=0.5,
+                         label=f"reference {reference['label']}")
+            plotted = True
+        if result.get("xy") and result["id"] != (reference or {}).get("id"):
+            xy = result["xy"]
+            axis_xy.plot(xy["plot_ax"], xy["plot_ay"], ".", ms=1, color="#0b4f8a", alpha=0.55,
+                         label=f"trial {result['id']}: {result['label']}")
+            plotted = True
+        axis_xy.set_aspect("equal", adjustable="datalim")
+        axis_xy.axhline(0.0, color="0.8", lw=0.5)
+        axis_xy.axvline(0.0, color="0.8", lw=0.5)
+        axis_xy.set_xlabel("ax", fontsize=7)
+        axis_xy.set_ylabel("ay", fontsize=7)
+        axis_xy.tick_params(labelsize=6)
+        axis_xy.set_title("Detrended residual locus (open arc = wobble too small)", fontsize=7)
+        if plotted:
+            axis_xy.legend(fontsize=6, loc="upper right")
+        ids, extents, colors = [], [], []
+        reference_extent = None
+        for trial in trials:
+            xy = trial.get("xy")
+            if not xy or not xy.get("extent"):
+                continue
+            ids.append(trial["id"])
+            extents.append(xy["extent"])
+            if trial["kind"] == "reference":
+                colors.append("0.62")
+                reference_extent = xy["extent"]
+            else:
+                colors.append("#0b4f8a")
+        if ids:
+            axis_bar.bar(range(len(ids)), extents, color=colors)
+            axis_bar.set_xticks(range(len(ids)))
+            axis_bar.set_xticklabels([str(trial_id) for trial_id in ids], fontsize=6)
+            if reference_extent and reference_extent > 0.0 and result.get("target"):
+                axis_bar.axhline(reference_extent / float(result["target"]), color="#b45309", lw=0.9, ls="--")
+                axis_bar.text(0.02, reference_extent / float(result["target"]), "target",
+                              fontsize=6, color="#b45309", va="bottom")
+            axis_bar.set_ylabel("XY extent", fontsize=7)
+            axis_bar.set_xlabel("trial id", fontsize=7)
+            axis_bar.tick_params(labelsize=6)
+            axis_bar.set_title("Residual extent per trial (lower = better)", fontsize=7)
+        else:
+            axis_bar.text(0.5, 0.5, "No XY extents yet", ha="center", va="center", fontsize=7, transform=axis_bar.transAxes)
+        fig.tight_layout()
+        fig.canvas.draw()
+        img = Image.fromarray(np.asarray(fig.canvas.buffer_rgba()).copy())
+        photo = ImageTk.PhotoImage(img)
+        self._intensity_xy_image_ref = photo
+        label.configure(image=photo, text="")
 
     def _save_intensity_trials(self) -> None:
         if not self._intensity_tuner.trials or self._intensity_tuner.active is not None:
@@ -5305,13 +5396,17 @@ class BasicVideoPlayer:
         if not path:
             return
         try:
+            saved_trials = []
+            for trial in self._intensity_tuner.trials:
+                trimmed = {key: value for key, value in trial.items() if key != "channels"}
+                saved_trials.append(trimmed)
             self._write_json_atomic(Path(path), {
-                "schema_version": 1,
-                "metric": "reference P98-P2 / test P98-P2; normalized ratio also required for target",
+                "schema_version": 2,
+                "metric": "reference P98-P2 / test P98-P2 span; plus detrended anisotropy XY extent and its reduction (drift-immune; see INTERFERENCE_TUNING.md)",
                 "timestamp_basis": "host perf_counter at SDK buffer receipt; not sensor exposure timestamps",
-                "measurement": "native Mono12 ROI mean intensity; no background subtraction; no measurement thinning",
-                "interpretation": "Observed intensity modulation under manually confirmed comparable Z sweeps; not proof of optical cancellation",
-                "trials": self._intensity_tuner.trials,
+                "measurement": "native Mono12 ROI mean intensity; no background subtraction; no measurement thinning; full-rate channel means retained in trial records only in-session",
+                "interpretation": "Observed intensity and anisotropy modulation under manually confirmed comparable Z sweeps; check the XY locus is a closed loop before reading the extent reduction as suppression",
+                "trials": saved_trials,
             })
             self._intensity_tuning_status_var.set(f"Saved {len(self._intensity_tuner.trials)} trials: {Path(path).name}")
         except Exception as exc:
@@ -5440,15 +5535,19 @@ class BasicVideoPlayer:
                 received_at = now
                 if self._intensity_diagnostic.active:
                     self._intensity_diagnostic.metadata["receipt_timestamp_fallback_used"] = True
+            x0, y0, _ = self._live_intensity_bounds(frame16.shape)
+            origin = (int(roi_meta.get("x", 0)) + x0, int(roi_meta.get("y", 0)) + y0)
             if self._intensity_diagnostic.active:
-                x0, y0, _ = self._live_intensity_bounds(frame16.shape)
-                origin = (int(roi_meta.get("x", 0)) + x0, int(roi_meta.get("y", 0)) + y0)
                 self._intensity_diagnostic.add(raw_square, val, float(received_at), now, self._live_intensity_frame_i, origin)
             if not np.isfinite(val):
                 return
             self._live_intensity_last_received_at = float(received_at)
             self._live_intensity_frame_age = max(0.0, now - float(received_at))
-            self._intensity_tuner.add(val, float(received_at), now, clipped=clipped)
+            channel_means = None
+            if raw_square.ndim == 2 and min(raw_square.shape) >= 2:
+                channel_grids = roi_channel_means(raw_square, origin[0] % 2, origin[1] % 2)
+                channel_means = tuple(float(np.mean(grid, dtype=np.float64)) for grid in channel_grids)
+            self._intensity_tuner.add(val, float(received_at), now, clipped=clipped, channels=channel_means)
             if self._live_intensity_started_at is None:
                 self._live_intensity_started_at = float(received_at)
             t_s = float(received_at) - self._live_intensity_started_at

@@ -1,9 +1,40 @@
-"""Intensity diagnostics and reference comparisons for manual tuning."""
+"""Intensity diagnostics and reference comparisons for manual tuning.
+
+Two complementary metrics are computed for each trial:
+
+- ``modulation_stats``: P98-P2 span of the ROI mean intensity. Sensitive to
+  any slow drift of focus or illumination, so reference and test windows are
+  only comparable when the manual Z sweep is faithfully repeated.
+- ``xy_residual_stats``: extent of the detrended anisotropy locus (ax, ay)
+  reconstructed from the four mosaic channel means. A moving-average
+  detrend removes slow drift (the anisotropy of a static dipole is
+  intensity-independent, so only the interference term moves it) while
+  preserving the fast hand-wobble traversal of the residual interference
+  arc/loop. This is the drift-immune interference metric and it also gives
+  the picture a span number cannot: an open arc means the Z sweep did not
+  cover a full fringe, a shrinking closed locus means the cancellation is
+  working.
+"""
 
 import json
 from pathlib import Path
 
 import numpy as np
+
+
+def roi_channel_means(values: np.ndarray, phase_x: int, phase_y: int) -> tuple:
+    """Split a mosaic ROI into its four analyser sub-grids and mean each one.
+
+    Channel order is 0, 90, 45, 135 for sensor mosaic [90, 45; 135, 0] with
+    the supplied ROI origin parity, matching the diagnostic columns.
+    """
+    values = np.asarray(values)
+    return (
+        values[1 - phase_y::2, 1 - phase_x::2],
+        values[phase_y::2, phase_x::2],
+        values[phase_y::2, 1 - phase_x::2],
+        values[1 - phase_y::2, phase_x::2],
+    )
 
 
 class IntensityDiagnostic:
@@ -70,16 +101,11 @@ class IntensityDiagnostic:
             self.mark(processed_at, "Invalid ROI shape", {"shape": list(values.shape)})
             return
         phase_x, phase_y = int(origin[0]) % 2, int(origin[1]) % 2
-        channels = (
-            values[1 - phase_y::2, 1 - phase_x::2],
-            values[phase_y::2, phase_x::2],
-            values[phase_y::2, 1 - phase_x::2],
-            values[1 - phase_y::2, phase_x::2],
-        )
+        channel_grids = roi_channel_means(values, phase_x, phase_y)
         self.data[self.count] = (
             elapsed, float(processed_at) - self.started_at, frame_index,
             np.mean(values, dtype=np.float64), analysed_mean,
-            *(np.mean(channel, dtype=np.float64) for channel in channels),
+            *(np.mean(channel, dtype=np.float64) for channel in channel_grids),
             np.min(values), np.max(values),
             np.count_nonzero(values == 0) / values.size,
             np.count_nonzero(values >= 4095) / values.size,
@@ -151,12 +177,14 @@ class IntensityTuner:
             "reference_id": self.reference["id"] if self.reference else None,
             "times_s": [],
             "intensity_dn": [],
+            "channels": [],
             "clipped": False,
             "warnings": [],
             "max_delivery_age_s": 0.0,
         }
 
-    def add(self, value: float, received_at: float, processed_at: float, *, clipped: bool = False) -> None:
+    def add(self, value: float, received_at: float, processed_at: float, *,
+            clipped: bool = False, channels=None) -> None:
         trial = self.active
         if trial is None:
             return
@@ -175,6 +203,17 @@ class IntensityTuner:
         trial["max_delivery_age_s"] = max(trial["max_delivery_age_s"], age)
         if age > 0.25 and "GUI backlog exceeds 250 ms" not in trial["warnings"]:
             trial["warnings"].append("GUI backlog exceeds 250 ms")
+        if channels is None:
+            if trial["channels"]:
+                if "Channel feed stopped" not in trial["warnings"]:
+                    trial["warnings"].append("Channel feed stopped")
+        else:
+            values = tuple(float(item) for item in channels)
+            if len(values) != 4 or not np.all(np.isfinite(values)):
+                if "Invalid channel data" not in trial["warnings"]:
+                    trial["warnings"].append("Invalid channel data")
+                values = (float("nan"),) * 4
+            trial["channels"].append(values)
         trial["times_s"].append(elapsed)
         trial["intensity_dn"].append(float(value))
         trial["clipped"] |= bool(clipped)
@@ -202,14 +241,30 @@ class IntensityTuner:
             times = trial["times_s"]
             if not times or times[0] > 0.25 or trial["duration_s"] - times[-1] > 0.25 or len(times) < 0.9 * expected:
                 warnings.append("Incomplete capture")
+            xy_stats = None
+            if trial["channels"]:
+                try:
+                    xy_stats = xy_residual_stats(times, trial["channels"], duration_s=trial["duration_s"])
+                    warnings.extend(xy_stats["warnings"])
+                except ValueError as exc:
+                    warnings.append(f"XY residual unavailable: {exc}")
+            # A trial with no channel feed at all stays valid: the span metric
+            # remains usable on its own (pre-XY workflow compatibility).
+        else:
+            xy_stats = None
         comparison = None
         if stats is not None and trial["kind"] == "test" and self.reference is not None:
             comparison = compare_modulation(self.reference["stats"], stats, target=trial["target"])
             warnings.extend(comparison["warnings"])
             comparison["target_reached"] &= complete and not warnings
+            reference_xy = self.reference.get("xy")
+            if xy_stats is not None and reference_xy is not None:
+                comparison.update(compare_xy(reference_xy, xy_stats, target=trial["target"]))
+                warnings.extend(comparison["xy_warnings"])
         result = {
             **trial,
             "stats": stats,
+            "xy": xy_stats,
             "comparison": comparison,
             "warnings": list(dict.fromkeys(warnings)),
             "complete": complete,
@@ -280,6 +335,140 @@ def compare_modulation(reference: dict, current: dict, *, target: float = 10.0) 
         "target": float(target),
         "target_reached": bool(reached),
         "warnings": warnings,
+    }
+
+
+def anisotropy_series(channels) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-sample (ax, ay, r) from an (n, 4) array of channel means (0, 90, 45, 135).
+
+    Samples with nonpositive pair sums or nonfinite channels come back NaN so
+    callers can filter them explicitly.
+    """
+    values = np.asarray(channels, dtype=np.float64)
+    if values.ndim != 2 or values.shape[1] != 4:
+        raise ValueError("Channels must be an (n, 4) array in order 0, 90, 45, 135.")
+    i0, i90, i45, i135 = (values[:, index] for index in range(4))
+    sum_x, sum_y = i0 + i90, i45 + i135
+    good = (
+        np.all(np.isfinite(values), axis=1)
+        & (sum_x > 0.0) & (sum_y > 0.0)
+    )
+    ax = np.full(values.shape[0], np.nan)
+    ay = np.full(values.shape[0], np.nan)
+    r = np.full(values.shape[0], np.nan)
+    np.divide(i0 - i90, sum_x, out=ax, where=good)
+    np.divide(i45 - i135, sum_y, out=ay, where=good)
+    with np.errstate(invalid="ignore"):
+        r = np.hypot(ax, ay)
+    return ax, ay, r
+
+
+def moving_average_residual(times_s, values, timescale_s: float) -> tuple[np.ndarray, np.ndarray]:
+    """Subtract a moving-average trend from a near-uniformly sampled series.
+
+    The residual keeps everything faster than roughly 1 / timescale_s (the
+    hand-wobble traversal of the interference locus) and discards slower
+    drift (focus, illumination). Edges are handled by reflection; the
+    returned mask excludes half the detrend window at each end.
+    """
+    times = np.asarray(times_s, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if times.ndim != 1 or values.shape != times.shape:
+        raise ValueError("Matching one-dimensional times and values are required.")
+    if not np.isfinite(timescale_s) or timescale_s <= 0.0:
+        raise ValueError("Detrend timescale must be positive and finite.")
+    span = float(times[-1] - times[0]) if len(times) > 1 else 0.0
+    fps = len(times) / span if span > 0.0 else 0.0
+    window = int(round(timescale_s * fps))
+    if window < 3 or 2 * window >= len(values):
+        raise ValueError(f"Not enough samples for a {timescale_s:g} s detrend window.")
+    padded = np.pad(values, window, mode="reflect")
+    trend = np.convolve(padded, np.ones(2 * window + 1) / (2 * window + 1), mode="valid")
+    interior = slice(window, len(values) - window)
+    return (values - trend)[interior]
+
+
+def xy_residual_stats(times_s, channels, *, duration_s: float) -> dict:
+    """Drift-immune interference metrics from detrended anisotropy samples.
+
+    Extent is the P98-P2 box diagonal of the detrended (ax, ay) locus: the
+    size of the residual interference arc/loop traced during the manual Z
+    sweep. Detrending uses half the trial duration (clamped to 2-10 s) so the
+    slow drift that defeats the raw P98-P2 intensity span is removed.
+    """
+    times = np.asarray(times_s, dtype=np.float64)
+    values = np.asarray(channels, dtype=np.float64)
+    if times.ndim != 1 or values.ndim != 2 or values.shape[0] != len(times) or values.shape[1] != 4:
+        raise ValueError("Matching times and (n, 4) channel data are required.")
+    ax, ay, r = anisotropy_series(values)
+    finite = np.isfinite(ax) & np.isfinite(ay)
+    warnings = []
+    if not np.any(finite):
+        raise ValueError("All anisotropy samples are invalid.")
+    if np.count_nonzero(finite) < 0.9 * len(times):
+        warnings.append("Over 10% invalid anisotropy samples")
+    detrend_s = float(np.clip(0.4 * float(duration_s), 1.0, 10.0))
+    ax_finite, ay_finite = ax[finite], ay[finite]
+    t_finite = times[finite]
+    fallback_used = False
+    while True:
+        try:
+            ax_res = moving_average_residual(t_finite, ax_finite, detrend_s)
+            ay_res = moving_average_residual(t_finite, ay_finite, detrend_s)
+            break
+        except ValueError:
+            if detrend_s <= 0.125 * float(duration_s) + 1e-9:
+                raise ValueError("Not enough samples for any detrend window") from None
+            detrend_s = max(0.125 * float(duration_s), 0.5 * detrend_s)
+            fallback_used = True
+    if fallback_used:
+        warnings.append(f"Reduced detrend window to {detrend_s:.2g} s")
+    extent_x = float(np.percentile(ax_res, 98.0) - np.percentile(ax_res, 2.0))
+    extent_y = float(np.percentile(ay_res, 98.0) - np.percentile(ay_res, 2.0))
+    extent = float(np.hypot(extent_x, extent_y))
+    r_mean = float(np.nanmean(r[finite]))
+    relative_extent = extent / r_mean if r_mean > 0.01 else None
+    if relative_extent is None:
+        warnings.append("Anisotropy radius below 0.01: normalized extent unavailable")
+    return {
+        "samples": int(np.count_nonzero(finite)),
+        "detrend_s": detrend_s,
+        "extent": extent,
+        "extent_x": extent_x,
+        "extent_y": extent_y,
+        "r_mean": r_mean,
+        "relative_extent": relative_extent,
+        "warnings": warnings,
+        # Downsampled residual locus for plotting (ax, ay) pairs.
+        "plot_ax": ax_res[:: max(1, len(ax_res) // 2000)].tolist(),
+        "plot_ay": ay_res[:: max(1, len(ay_res) // 2000)].tolist(),
+    }
+
+
+def compare_xy(reference: dict, current: dict, *, target: float = 10.0) -> dict:
+    """Extent-based reduction between a reference and a test trial."""
+    warnings = []
+    extent_reduction = None
+    relative_reduction = None
+    if reference.get("extent") and current.get("extent") and reference["extent"] > 0.0 and current["extent"] > 0.0:
+        extent_reduction = reference["extent"] / current["extent"]
+    else:
+        warnings.append("XY extent not measurable in both trials")
+    ref_rel = reference.get("relative_extent")
+    cur_rel = current.get("relative_extent")
+    if ref_rel and cur_rel and ref_rel > 0.0 and cur_rel > 0.0:
+        relative_reduction = ref_rel / cur_rel
+    xy_target_reached = bool(
+        not warnings
+        and extent_reduction is not None
+        and extent_reduction >= target
+        and (relative_reduction is None or relative_reduction >= target)
+    )
+    return {
+        "extent_reduction": extent_reduction,
+        "extent_relative_reduction": relative_reduction,
+        "xy_target_reached": xy_target_reached,
+        "xy_warnings": warnings,
     }
 
 

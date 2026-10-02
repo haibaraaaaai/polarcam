@@ -3,6 +3,18 @@
 All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
+### Added
+- Interference tuning: drift-immune XY residual metric. Trials record the four
+  mosaic channel means; the detrended anisotropy locus extent gives an
+  interference measure that slow focus/illumination drift cannot fake, plus the
+  picture the span number lacked (open arc = Z wobble did not cover a full
+  fringe). The tuning window shows the residual locus and per-trial extent
+  chart; trials table gains XY extent / XY reduction columns; trial JSON saves
+  are schema_version 2. New offline analyser
+  `python -m polarcam.live.interference_npz_analysis RECORDING.npz` for
+  diagnostic recordings, and `tests/test_interference_metrics.py` validating
+  the metric against the known sinc null. See INTERFERENCE_TUNING.md.
+
 ### Changed
 - Use native camera counts for magnifier intensity measurements; keep 8-bit
   conversion and peak-preserving display reduction out of numerical scoring.
