@@ -45,6 +45,13 @@ from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, 
 from polarcam.live import intensity_spots
 
 
+def _dispatch_camera_events() -> None:
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.MetaCall)
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
 def _append_timing_log(msg: str) -> None:
     try:
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2263,8 +2270,12 @@ class BasicVideoPlayer:
         ttk.Label(orientation, text="Frames / average").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(orientation, textvariable=self._intensity_window_var, width=12).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Label(orientation, text="Theta model (finite-NA)").grid(row=2, column=0, sticky="w")
-        ttk.Combobox(orientation, textvariable=self._intensity_medium_var, values=tuple(self.THETA_RECON_MODELS),
-                     state="readonly", width=18).grid(row=2, column=1, sticky="w", padx=6)
+        self._theta_model_combo = ttk.Combobox(
+            orientation, textvariable=self._intensity_medium_var,
+            values=tuple(self.THETA_RECON_MODELS), state="readonly", width=18,
+        )
+        self._theta_model_combo.grid(row=2, column=1, sticky="w", padx=6)
+        self._theta_model_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_spot_view())
         ttk.Button(orientation, text="All-rod distribution", command=self._open_intensity_distribution).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=6)
 
@@ -2281,6 +2292,11 @@ class BasicVideoPlayer:
         ttk.Label(right, text="Phi(t)").pack(side=tk.TOP, anchor="w")
         self._phi_img_label = ttk.Label(right)
         self._phi_img_label.pack(side=tk.TOP, anchor="w", pady=(2, 10))
+
+        ttk.Label(right, text="Theta(t)").pack(side=tk.TOP, anchor="w")
+        self._theta_img_label = ttk.Label(right)
+        self._theta_img_label.pack(side=tk.TOP, anchor="w", pady=(2, 10))
+        self._theta_img_ref = None
 
         ttk.Label(right, text="Phi FFT").pack(side=tk.TOP, anchor="w")
         self._fft_img_label = ttk.Label(right)
@@ -5603,7 +5619,7 @@ class BasicVideoPlayer:
             return
         try:
             if self._live_intensity_app is not None:
-                self._live_intensity_app.processEvents()
+                _dispatch_camera_events()
         except Exception:
             pass
         if not self._live_intensity_running:
@@ -6036,9 +6052,12 @@ class BasicVideoPlayer:
             return
         try:
             if self._live_app is not None:
-                self._live_app.processEvents()
+                _dispatch_camera_events()
         except Exception:
             pass
+
+        if not self._live_running:
+            return
 
         frame = None
         try:
@@ -6509,7 +6528,7 @@ class BasicVideoPlayer:
             return
         try:
             if self._spotrec_app is not None:
-                self._spotrec_app.processEvents()
+                _dispatch_camera_events()
         except Exception:
             pass
 
@@ -8276,6 +8295,7 @@ class BasicVideoPlayer:
             self._spot_img_label.configure(image="")
             self._fft_img_label.configure(image="")
             self._phi_img_label.configure(image="")
+            self._theta_img_label.configure(image="")
             self._xy_img_label.configure(image="")
             if hasattr(self, "_dir_var"):
                 self._dir_var.set("B: -")
@@ -8286,6 +8306,7 @@ class BasicVideoPlayer:
             self._spot_img_ref = None
             self._fft_img_ref = None
             self._phi_img_ref = None
+            self._theta_img_ref = None
             self._xy_img_ref = None
             self._dir_psd_ref = None
             self._dir_hand_ref = None
@@ -8360,6 +8381,8 @@ class BasicVideoPlayer:
         if self._spot_view_cache and len(self._spot_view_cache) == n:
             cache_entry = self._spot_view_cache[self._spot_idx]
         fps_key = round(float(plot_fps), 6) if plot_fps and plot_fps > 0.0 else 0.0
+        self._theta_img_ref = ImageTk.PhotoImage(self._make_theta_plot_image(xy_series, plot_fps))
+        self._theta_img_label.configure(image=self._theta_img_ref)
         if self._analysis_detection_mode == "Intensity":
             self._render_intensity_spot_series(xy_series, phi_series, plot_fps)
             self._spot_status_var.set(f"Spot {self._spot_idx + 1} / {n}")
@@ -9231,6 +9254,32 @@ class BasicVideoPlayer:
             self._ui_call(self._show_error, "Frame decoding", str(exc))
         finally:
             self.decode_done = True
+
+    def _make_theta_plot_image(self, xy_series, fps):
+        if Figure is None or FigureCanvas is None:
+            image = Image.new("RGB", (330, 200), "white")
+            ImageDraw.Draw(image).text((12, 80), "Theta plot requires matplotlib", fill="black")
+            return image
+        model = self._intensity_medium_var.get()
+        xy = np.asarray(xy_series, dtype=np.float64).reshape(-1, 2)
+        vectors = intensity_spots.unit_vectors(xy, self._theta_recon_lut(model))
+        theta = np.degrees(np.arccos(np.clip(vectors[:, 2], -1.0, 1.0)))
+        rate = float(fps) if fps and np.isfinite(fps) and fps > 0 else None
+        figure = Figure(figsize=(3.3, 2.0), dpi=100)
+        axis = figure.add_subplot(111)
+        axis.plot(np.arange(len(theta)) / (rate or 1.0), theta, linewidth=.7, marker=".", markersize=2)
+        axis.set(
+            xlabel="Time (s)" if rate is not None else "Frame index", ylabel="Theta (deg)",
+            ylim=(0, 90), title=self.THETA_RECON_MODELS[model]["label"],
+        )
+        axis.title.set_fontsize(9)
+        if not np.isfinite(theta).any():
+            axis.text(.5, .5, "No valid theta samples" if len(theta) else "Waiting for frames",
+                      ha="center", transform=axis.transAxes, fontsize=8)
+        figure.tight_layout(pad=.7)
+        canvas = FigureCanvas(figure)
+        canvas.draw()
+        return Image.fromarray(np.asarray(canvas.buffer_rgba()).copy())
 
     def _render_intensity_spot_series(self, xy_series, phi_series, fps):
         if Figure is None or FigureCanvas is None:

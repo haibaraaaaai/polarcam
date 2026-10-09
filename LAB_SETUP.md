@@ -68,6 +68,42 @@ If the runtime files are actually missing, repair that Python installation with
 Tcl/Tk support. Do not copy Tcl/Tk from another Python or Conda installation. Other
 standalone scripts do not automatically use the main launcher's environment fix.
 
+### Native GIL Crash During Live Start (2026-10-09)
+
+The user reported a fatal `PyEval_RestoreThread` error in the main thread at
+`_live_tick -> QApplication.processEvents`, while the IDS worker was preparing
+buffers for full-sensor ROI. Python was initialized, not shutting down. The
+later threading-shutdown exception follows the fatal error and is not evidence
+of its cause. This cannot be caught or recovered by a Python try/except.
+
+Installed runtime at investigation: Python 3.13.0, PySide6/Shiboken6 6.11.2,
+IDS peak 1.16.0.0.9 and IDS IPL 1.17.2.0.8. No packages were changed. A basic
+camera-free Tk/Qt timer reproduction did NOT trigger the fatal error; exact root
+cause and any particular package incompatibility are unproven.
+
+Applied a narrow mitigation in the main Tk GUI: live, magnifier intensity and
+spot-recording ticks deliver Qt posted MetaCall and DeferredDelete events instead
+of calling the broad native `processEvents` pump. Tk remains responsible for
+native window messages. Camera queued signals still arrive on the main thread;
+the acquisition worker keeps its own Qt event loop. No camera ROI/timing commands,
+SDK buffer handling, pixel calculations or offline theta logic were changed.
+Live tick also rechecks its running flag after dispatch before rescheduling.
+The standalone capture subprocess has no Tk window and retains its event loop.
+
+Verification: an isolated subprocess delivered 1000 real queued Qt/NumPy frames
+from a QThread through the camera facade into Tk callbacks, checked deferred
+deletion and excluded unrelated posted events, without camera access. Dispatch
+and stop-during-dispatch regressions pass. Full suite: 100 tests, 98 pass; two
+previously reproduced tuning-reference failures remain. Hardware validation of
+this mitigation is still required; do not claim the native crash is fixed.
+
+Retest: close other camera applications, relaunch Polarcam via the normal launcher,
+and try Start live feed once without starting a recording. Then check Stop/start
+and magnifier Start/Stop. If it aborts again, keep the new complete traceback and
+record the exact action; do not repeatedly retry during an experiment. Native
+binding/SDK compatibility or a process-isolated camera path may need investigation.
+No running user process or real camera was operated during this change.
+
 ## Today's Staged Plan
 
 The experiment is scheduled for 2026-10-02. Stage 1 is startup and desktop access;
@@ -217,6 +253,17 @@ scatter and a normalized 64x64 histogram density. Projection is
 `(nx, ny) / (1 + nz)`. Density is probability per PROJECTED-PLANE area, with one
 vote per valid rod/window, not density per solid angle and not a smoothed KDE.
 The displayed acquisition labels come from the saved stack, not today's controls.
+
+**Theta(t)** is available below **Phi(t)** in the scrollable Spot analysis sidebar
+(2026-10-09). It shows the selected spot's per-frame theta in degrees, using the
+same finite-NA LUT and unit-vector reconstruction as All-rod distribution. Choose
+**Theta model (finite-NA)** to switch water/glycerol50; the plot refreshes immediately.
+Nonfinite or out-of-model X/Y radii appear as gaps, not values clipped to 90 degrees.
+Navigation and inspection overrides use the same spot/time base as Phi(t).
+This is a per-frame trace, independent of the distribution's temporal averaging
+settings. In Intensity mode it matches the distribution with Frames / average = 1;
+in Time variation mode the same theta conversion uses that mode's existing X/Y
+series. The underlying model/calibration limitations below still apply.
 
 Scientific conventions and limits:
 

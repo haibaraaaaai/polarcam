@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 ### Added
+- Per-spot Theta(t) beside Phi(t), using the All-rod distribution reconstruction
+  and selected finite-NA model, with invalid-sample gaps and model-change refresh.
 - Interference tuning: drift-immune XY residual metric. Trials record the four
   mosaic channel means; the detrended anisotropy locus extent gives an
   interference measure that slow focus/illumination drift cannot fake, plus the
@@ -16,6 +18,10 @@ All notable changes to this project will be documented in this file.
   the metric against the known sinc null. See INTERFERENCE_TUNING.md.
 
 ### Changed
+- Limit Qt event delivery inside the Tk GUI to queued calls and deferred cleanup,
+  mitigating the native event-pump boundary implicated in a reported GIL abort.
+  Real queued-frame/Tk subprocess tests pass; the original hardware crash has not
+  been reproduced or confirmed fixed. Standalone capture event pumping is unchanged.
 - Use native camera counts for magnifier intensity measurements; keep 8-bit
   conversion and peak-preserving display reduction out of numerical scoring.
 - Default the main GUI's live, magnifier, full-frame and spot-capture exposure to

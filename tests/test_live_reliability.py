@@ -4,8 +4,10 @@ import json
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 from types import SimpleNamespace
 import unittest
@@ -22,6 +24,115 @@ with patch.object(sys, "path", [str(LIVE_DIR), *sys.path]):
     from polarcam.live import angle_distribution_analysis, fetch_frames, recording_io
     from polarcam.live import Spinners_gui_live as live_gui
     from backend.ids_backend import IDSCamera, _StreamWorker
+
+
+class CameraEventDispatchTests(unittest.TestCase):
+    def test_dispatch_delivers_only_queued_calls_and_deferred_deletes(self):
+        from PySide6.QtCore import QCoreApplication, QEvent
+
+        with patch.object(QCoreApplication, "sendPostedEvents") as send:
+            with patch.object(QCoreApplication, "processEvents", side_effect=AssertionError("Native event pump used")):
+                live_gui._dispatch_camera_events()
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args_list[0].args, (None, QEvent.Type.MetaCall))
+        self.assertEqual(send.call_args_list[1].args, (None, QEvent.Type.DeferredDelete))
+
+    def test_tk_and_real_qt_worker_delivery_in_isolated_process(self):
+        if sys.platform != "win32" and not os.environ.get("DISPLAY"):
+            self.skipTest("Tk display unavailable")
+        script = textwrap.dedent('''
+            import sys
+            import threading
+            import tkinter as tk
+            from pathlib import Path
+            import numpy as np
+            from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QCoreApplication, QEvent
+            from PySide6.QtWidgets import QApplication
+            sys.path.insert(0, sys.argv[1])
+            from Spinners_gui_live import _dispatch_camera_events
+            from backend.ids_backend import IDSCamera
+
+            root = tk.Tk()
+            root.withdraw()
+            application = QApplication.instance() or QApplication([])
+            main_thread = threading.get_ident()
+            camera = IDSCamera()
+            delivered = []
+            heartbeat = []
+            deleted = []
+            failures = []
+            root.report_callback_exception = lambda *error: failures.append(error)
+            status = tk.StringVar(root)
+
+            class Producer(QObject):
+                frame = Signal(object, float)
+                finished = Signal()
+
+                @Slot()
+                def run(self):
+                    for index in range(1000):
+                        self.frame.emit(np.full((14, 256), index, dtype=np.uint16), index / 1000)
+                    self.finished.emit()
+
+            def receive(frame, stamp):
+                assert threading.get_ident() == main_thread
+                assert frame[0, 0] == len(delivered)
+                assert stamp == len(delivered) / 1000
+                delivered.append(stamp)
+                status.set(str(len(delivered)))
+
+            class UnrelatedEvent(QObject):
+                seen = False
+
+                def event(self, event):
+                    if event.type() == QEvent.Type.User:
+                        self.seen = True
+                        return True
+                    return super().event(event)
+
+            sink = UnrelatedEvent()
+            QCoreApplication.postEvent(sink, QEvent(QEvent.Type.User))
+            disposable = QObject()
+            disposable.destroyed.connect(lambda: deleted.append(True))
+            disposable.deleteLater()
+            camera.frame_timed.connect(receive)
+            producer = Producer()
+            thread = QThread()
+            producer.moveToThread(thread)
+            producer.frame.connect(camera._publish_frame, Qt.ConnectionType.QueuedConnection)
+            producer.finished.connect(producer.deleteLater)
+            producer.finished.connect(thread.quit, Qt.ConnectionType.DirectConnection)
+            thread.started.connect(producer.run)
+
+            def pump():
+                _dispatch_camera_events()
+                heartbeat.append(True)
+                if len(delivered) == 1000 and len(heartbeat) >= 3:
+                    root.quit()
+                else:
+                    root.after(1, pump)
+
+            thread.start()
+            root.after(0, pump)
+            root.after(5000, root.quit)
+            try:
+                root.mainloop()
+                assert len(delivered) == 1000, len(delivered)
+                assert status.get() == "1000"
+                assert deleted and not sink.seen
+                assert not failures, failures
+                print("Delivered 1000 queued camera frames under Tk; deferred cleanup passed", flush=True)
+            finally:
+                thread.quit()
+                assert thread.wait(5000)
+                root.destroy()
+        ''')
+        result = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", script, str(LIVE_DIR)],
+            capture_output=True, text=True, env=cli._tk_environment(), timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Delivered 1000", result.stdout)
 
 
 class GuiStartupTests(unittest.TestCase):
@@ -400,6 +511,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.controllers = []
         self.events = []
         self.qt_app = SimpleNamespace(processEvents=lambda: None)
+        self.enterContext(patch.object(live_gui, "_dispatch_camera_events", side_effect=lambda: self.qt_app.processEvents()))
         self.enterContext(patch("PySide6.QtWidgets.QApplication", SimpleNamespace(instance=lambda: self.qt_app)))
         self.enterContext(patch(f"{fetch_frames.Controller.__module__}.Controller", side_effect=self.make_controller))
         self.enterContext(patch.object(fetch_frames.Controller, "open", side_effect=AssertionError("Real camera access")))
@@ -515,6 +627,81 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.root.update_idletasks()
         self.assertIsNotNone(self.player._intensity_distribution_window)
         self.errors.assert_not_called()
+
+    def test_theta_plot_matches_per_frame_distribution_for_both_models(self):
+        self.load_intensity_stack(blank_frame=True)
+        self.player._intensity_window_var.set("1")
+        xy = self.player._spot_xy_series[0]
+        for model in ("water", "glycerol50"):
+            with self.subTest(model=model):
+                self.player._intensity_medium_var.set(model)
+                result, _ = self.player._intensity_distribution_data()
+                expected = np.degrees(np.arccos(np.clip(result["directions"][:, 0, 2], -1, 1)))
+                figure = live_gui.Figure(figsize=(3.3, 2.0), dpi=100)
+                with patch.object(live_gui, "Figure", return_value=figure):
+                    image = self.player._make_theta_plot_image(xy, 80.0)
+                line = figure.axes[0].lines[0]
+                np.testing.assert_allclose(line.get_ydata(), expected, equal_nan=True)
+                np.testing.assert_allclose(line.get_xdata(), np.arange(5)/80)
+                self.assertEqual(image.size, (330, 200))
+                self.assertEqual(figure.axes[0].get_ylim(), (0, 90))
+                self.assertIn(model if model == "water" else "glycerol", figure.axes[0].get_title())
+
+    def test_theta_plot_preserves_invalid_gaps_and_rejects_above_model_radius(self):
+        self.player._intensity_medium_var.set("water")
+        figure = live_gui.Figure(figsize=(3.3, 2.0), dpi=100)
+        with patch.object(live_gui, "Figure", return_value=figure):
+            self.player._make_theta_plot_image([(0, 0), (.4, 0), (np.nan, 0), (.85, 0)], 10)
+        theta = figure.axes[0].lines[0].get_ydata()
+        self.assertEqual(theta[0], 0)
+        self.assertGreater(theta[1], 0)
+        self.assertTrue(np.isnan(theta[2:]).all())
+        np.testing.assert_allclose(figure.axes[0].lines[0].get_xdata(), [0, .1, .2, .3])
+
+    def test_theta_plot_refreshes_on_model_selection_and_clears_on_close(self):
+        self.load_intensity_stack()
+        self.assertIsNotNone(self.player._theta_img_ref)
+        with patch.object(self.player, "_make_theta_plot_image", wraps=self.player._make_theta_plot_image) as render:
+            self.player._intensity_medium_var.set("glycerol50")
+            self.player._theta_model_combo.event_generate("<<ComboboxSelected>>")
+            self.root.update()
+            self.assertTrue(render.called)
+        self.assertTrue(self.player._close_video())
+        self.assertIsNone(self.player._theta_img_ref)
+        self.assertFalse(self.player._theta_img_label.cget("image"))
+        self.errors.assert_not_called()
+
+    def test_theta_plot_follows_selected_spot_and_inspection_timing_in_both_modes(self):
+        self.load_intensity_stack()
+        self.player._spot_centers.append((42.0, 42.0))
+        self.player._spot_xy_series.append([(.2, .1)] * 5)
+        self.player._spot_phi_series.append([.1] * 5)
+        for mode in ("Intensity", "Time variation"):
+            with self.subTest(mode=mode):
+                self.player._analysis_detection_mode = mode
+                self.player._spot_idx = 0
+                with patch.object(self.player, "_make_theta_plot_image", wraps=self.player._make_theta_plot_image) as render:
+                    self.player._next_spot()
+                    render.assert_called_with(self.player._spot_xy_series[1], 80.0)
+                    self.player._prev_spot()
+                    render.assert_called_with(self.player._spot_xy_series[0], 80.0)
+                    key = self.player._spot_center_key(self.player._spot_centers[0])
+                    self.player._spot_inspect_overrides[key] = {"xy": [(.3, .1)], "phi": [.1], "fps": 123.0}
+                    self.player._update_spot_view()
+                    render.assert_called_with([(.3, .1)], 123.0)
+                self.player._spot_inspect_overrides.clear()
+        self.errors.assert_not_called()
+
+    def test_theta_plot_handles_empty_and_all_invalid_series(self):
+        for xy, message in (([], "Waiting for frames"), ([(np.nan, 0), (1, 1)], "No valid theta samples")):
+            with self.subTest(xy=xy):
+                figure = live_gui.Figure(figsize=(3.3, 2.0), dpi=100)
+                with patch.object(live_gui, "Figure", return_value=figure):
+                    self.player._make_theta_plot_image(xy, 0)
+                axis = figure.axes[0]
+                self.assertEqual(axis.get_xlabel(), "Frame index")
+                self.assertIn(message, [text.get_text() for text in axis.texts])
+                self.assertFalse(np.isfinite(axis.lines[0].get_ydata()).any())
 
     def test_intensity_mode_can_switch_back_to_time_variation(self):
         self.load_intensity_stack()
@@ -702,6 +889,14 @@ class IntensityLifecycleTests(unittest.TestCase):
                 self.player._live_intensity_tick()
         schedule.assert_not_called()
         self.assertIsNone(self.player._live_intensity_after_id)
+
+    def test_live_tick_does_not_reschedule_after_stop_during_qt_events(self):
+        self.player._start_live_feed()
+        self.assertTrue(self.player._live_running)
+        with patch.object(self.qt_app, "processEvents", side_effect=self.player._stop_live_feed):
+            self.player._live_tick()
+        self.assertFalse(self.player._live_running)
+        self.assertIsNone(self.player._live_after_id)
 
     def test_intensity_measurements_keep_native_precision(self):
         analyser = self.start_analyser()

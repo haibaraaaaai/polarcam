@@ -16,6 +16,385 @@ defeat the purpose. The spot cycler is a new feature, not implemented in v3.
 
 No hardware transition benchmark or cycler implementation was made in this step.
 
+## Update: 2026-10-09 Native Live-Start Crash Mitigation
+
+After the theta change the user reported fatal PyEval_RestoreThread (GIL released,
+NULL thread state), current thread at Spinners_gui_live._live_tick/processEvents,
+worker at ids_backend._announce_and_queue during full_sensor ROI. This traceback
+does not implicate theta calculations or establish the exact native root cause.
+Runtime: Python 3.13.0, PySide6/Shiboken6 6.11.2, IDS peak 1.16.0.0.9/IPL 1.17.2.0.8.
+No version changes, driver changes, hardware access or user-process restarts.
+
+Hypothesis: broad Qt native-window dispatch nested under Tk can cross the native
+GIL boundary unsafely. A simple isolated Tk/Qt timer probe did NOT reproduce the
+fatal error. Do not present this hypothesis as a confirmed SDK/PySide/Tk bug.
+Applied the smallest event-dispatch mitigation: _dispatch_camera_events calls
+QCoreApplication.sendPostedEvents for MetaCall and DeferredDelete only, replacing
+all three main-Tk-GUI processEvents calls (live, intensity, legacy spot recording).
+No main-thread Qt timers are required in these camera paths; worker Qt loops
+remain unchanged. Standalone capture subprocess pumping is unchanged. Added a
+post-dispatch live-running check to avoid restarting a timer after callback stop.
+
+CameraEventDispatchTests verify event selection and a real QThread -> IDSCamera
+frame/timestamp relay into Tk callbacks in an isolated subprocess. 1000 frames
+arrive in order on the main thread; deferred deletes work and unrelated posted
+events are not dispatched. A new live-stop-during-dispatch regression passes.
+Fake-controller fixtures now mock the dispatch helper explicitly; they are not
+proof of native interoperability. Full suite: 100 tests, 98 pass, the SAME two
+baseline tuning-reference failures documented below. Code diagnostics clean.
+
+Status: tested mitigation, NOT a hardware-confirmed fix. User must relaunch and
+try live start/stop then magnifier transitions. Preserve any new fatal traceback;
+if this fails, investigate native package compatibility or camera process isolation
+rather than layering Python exception handlers over a native abort. See
+[LAB_SETUP.md](LAB_SETUP.md#native-gil-crash-during-live-start-2026-10-09).
+
+## Update: 2026-10-09 Per-Spot Theta(t)
+
+Added Theta(t) below Phi(t) in the Spot analysis sidebar, in both detection modes.
+It uses the selected spot's X/Y series and the same intensity_spots.unit_vectors
+and finite-NA LUT as All-rod distribution; theta is degrees(arccos(nz)). Nonfinite
+and above-model-radius samples remain NaN gaps. This deliberately does not use
+the older saturating theta helper that maps above-range radii to 90 degrees.
+The model selector refreshes the plot immediately. Spot navigation, inspection
+overrides and FPS follow Phi(t); closing/replacing a source clears the plot.
+It is a per-frame time trace, not the distribution's configurable temporal mean.
+
+Five new focused camera-free tests pass: per-frame distribution equivalence for
+both models, invalid gaps, model selection and close cleanup, both detection modes/
+navigation/inspection FPS overrides, and empty/all-invalid states. Tk screenshots
+verified a nonblank readable plot at 1200x800 after sidebar scrolling, without camera
+access. Code diagnostics clean. Full suite: 97 tests, 95 pass, two existing tuning
+failures in test_settings_change_invalidates_tuning_reference and
+test_tuning_window_reports_target_and_exports_native_trials. Both reproduced by
+executing the committed HEAD GUI in an isolated module against those tests, without
+replacing worktree files; they are unrelated to theta and left unchanged.
+Do not describe the full suite as passing. Changes remain local/uncommitted;
+existing lab notes and root-level experimental AVIs were preserved.
+
+## Lab Result: 2026-10-02 Mean-Intensity Oscillation
+
+### Latest: Simultaneous Multi-Spot Synchrony
+
+User requested position/intensity synchrony in the newer official-camera AVI
+[recording_2026-10-02_2.avi](recording_2026-10-02_2.avi). Decoded all 21,407 frames:
+376x116, MJPG uint8, identical decoded B/G/R channels, header 786 fps, 27.235 s.
+No sensor timestamps/calibrated raw photometry; physical timing assumes AVI FPS.
+Identified separated spots A=(54,89), B=(90,53), C=(113,24), D=(171,79), E=(323,34)
+in local AVI pixels. Excluded the spot near the left image boundary.
+
+Methods: fixed even-origin 28x28 apertures, per-frame uncorrected mean; 39-frame
+(49.6 ms) averaged images for tracking. Secondary intensity uses aperture sum
+minus area times outer-four-pixel-border median. Gaussian+constant fits operate
+on 2x2-polarizer-cell averages. Analyses exclude the last partial bin. Correlations
+are descriptive, not independent-sample significance tests or proof of causality.
+
+- Brightness: A/B/D/E have shared slow fluctuations near 0.625 Hz. C is less
+  synchronized and its strongest intensity peak is about 0.552 Hz. In the
+  0.35-1.2 Hz band (third-order Butterworth, forward/backward filtering, two seconds
+  trimmed at each edge), uncorrected ROI-mean correlations among A/B/D/E are
+  0.71-0.81; C versus the others is 0.11-0.38. After local background correction,
+  A/B/D/E correlations are 0.61-0.76; C correlations 0.34-0.54. Whole unfiltered
+  corrected intensity correlations are weaker (0.32-0.52 within A/B/D/E).
+  State the filtering explicitly; shared frequency is not exact phase locking.
+- Position: only A/B/C have reliable isolated-image fits. Their X P2-P98 spans
+  are 0.40/0.37/0.62 px; Y spans 0.54/0.54/0.59 px. D is contaminated by nearby
+  structure and E fits hit centre bounds in 70 coordinate instances. Apparent
+  multi-pixel D/E movements are NOT accepted as physical motion despite optimizer
+  success. D/E intensity apertures remain usable with background/structure caveats.
+- With linear drift removed, Gaussian Y-position correlations A-B/A-C/B-C are
+  0.040/0.242/0.604; X correlations -0.016/0.443/0.163. Thus there is some shared
+  B-C vertical and A-C horizontal variation, not all spots translating together.
+- Independent ECC translation registration succeeds for all 549 bins of A/B/C,
+  median template correlations 0.997/0.997/0.994. Its Y-pair correlations are
+  -0.090/0.149/0.554, corroborating the partial, nonuniform pattern. ECC/Gaussian
+  Y-position correlations within A/B/C are 0.925/0.959/0.933.
+- Within each bright spot, corrected intensity versus Y position after linear
+  detrending gives A=-0.513, B=+0.416, C=+0.462. Slow-band values after edge trimming
+  are -0.638/+0.674/+0.455. Brightness-position coupling differs by spot; there is
+  no single same-sign, same-displacement relation across the field.
+
+Conclusion: partial common brightness modulation, but no demonstrated single
+rigid XY motion accounting for it. Gaussian centres/ECC shifts are apparent optical
+positions: changing PSF, interference or polarization can bias them. Shared axial
+or optical effects remain possible; do not claim physical stage movement or laser
+instability established. No application code/hardware/original AVI changed.
+
+Saved [labelled synchrony plot](runs/recording_2026-10-02_2_spot_synchrony.png)
+(brightness graph/matrix use the background-corrected slow component),
+[tracking montage](runs/recording_2026-10-02_2_tracking_check.png),
+[measurements](runs/recording_2026-10-02_2_spot_measurements.npz),
+[ECC cross-check](runs/recording_2026-10-02_2_position_validation.npz) and
+[results with position reliability mask](runs/recording_2026-10-02_2_sync_results.npz).
+Original measurement archive retains exploratory D/E fits; use the reliability
+mask from sync_results before interpreting position. All derived data are in runs/.
+
+### Earlier: Three 17:32-17:34 Periodicity Checks
+
+Compared native mean-intensity diagnostics ending 173214, 173339 and 173433
+in runs/. Each is 30 s, actual exposure 1194.270 us and FPS 798.791, gains 1,
+14x14 analysis crop, subtraction OFF. Raw/analysed means agree; no clipping,
+nonfinite samples, non-increasing receipt times or recorded changes/errors.
+The first rod centre is (1067.03,795.59); the last two share (1031.93,804.95).
+Manual condition notes are empty, so do not infer changed hardware conditions.
+
+- 173214: clear repeating component at 0.667 Hz / 1.50 s, strongest throughout
+  the trace; ten-second sections peak at roughly 0.6-0.7 Hz.
+- 173339: 0.667 Hz / 1.50 s peak remains, alongside a nearly comparable
+  0.233 Hz / 4.29 s spectral peak. Less regular; middle ten seconds favour the
+  faster component while beginning/end have stronger slow variation.
+- 173433: mixed/broader variation, strongest oscillatory peak near 0.533 Hz /
+  1.88 s, plus 0.633 Hz / 1.58 s and substantial slower drift. Ten-second
+  sections peak near 0.7/0.5/0.7 Hz. Not one stationary sinusoid.
+
+Frequency bins are about 0.033 Hz for whole traces; identical peak bins do not
+establish exact frequency matching or phase locking between separate recordings.
+Frame-order and host-bin spectra agree. Max GUI delays 112/59/52 ms and
+intensity/age correlations 0.064/0.023/0.005 do not suggest a simple backlog origin.
+Means 198.43/206.47/208.33 DN; P2-P98 spans relative to means 54.36/50.14/54.07%.
+These spans include drift/noise and are not single-frequency amplitudes or
+suppression scores. No inference that a change in periodicity equals cancellation.
+Saved [comparison plot](runs/intensity_diagnostic_20261002_1732-1734_periodicity.png).
+Original files and application code unchanged.
+
+### Earlier: Independent Official Camera-App Recording
+
+User supplied [recording_2026-10-02.avi](recording_2026-10-02.avi) at repository
+root, described as one rod, first approximately 16 columns, full FPS for about
+30 seconds in the official camera app. All 50,084 frames decoded successfully;
+AVI header is 1512 fps, 256x16 pixels, MJPG. This implies 33.124 s playback duration.
+Decoded data are uint8 BGR with identical channels, not native 12-bit sensor data.
+No sidecar confirms exposure/gain/automatic controls or sensor timestamps.
+
+Measured grayscale means over rows 0:16, columns 0:16 only, not the full strip.
+Strongest Hann-windowed, linearly detrended periodogram peak is 0.60379 Hz
+(1.656 s) using the AVI time base. The time trace contains a pronounced repeating
+cycle, with some period/amplitude variability; thirds peak near 0.725/0.634/0.634
+Hz at coarser resolution. This closely matches the slow pattern in Polarcam data.
+Mean is 22.037 decoded 8-bit levels, P2/P98 11.402/32.786. Do not compare those
+levels directly with native DN or infer calibrated suppression amplitudes.
+289 frames contain at least one 255-valued pixel in the crop; codec/display
+conversion and small endpoint clipping are additional photometric limitations.
+
+This independent app result strongly argues that the phenomenon is not generated
+by Polarcam's mean callback, Tk plotting or XY detrending. It does NOT eliminate
+camera/driver/SDK effects, camera automatic settings, optical/sample/mechanical
+effects, or processing in the official export. Exact physical frequency assumes
+the AVI playback rate matches acquisition rate. Do not claim hardware source proven.
+
+Saved [mean-intensity plot](runs/recording_2026-10-02_avi_mean_intensity.png) and
+[measurement archive](runs/recording_2026-10-02_avi_measurements.npz), including
+decoded per-frame crop means and preview samples. Original AVI unchanged; no
+camera operated or application code changed. The source AVI is at repository
+root; do not include experimental data in a commit without explicit intent.
+
+### Earlier: 3 FPS Full-Frame Recording
+
+Analysed [frame_stack_20261002-170258.npy](runs/datasets/temp/frame_stack_20261002-170258.npy)
+using its JSON: 150 measurement frames after phase-marker removal, 2056x2464
+uint16, actual 2.999994 fps, exposure 597.514 us, gains 1, background OFF.
+This gives 50.000 s nominal duration (first-to-last frame 49.667 s), not a measured
+sensor timestamp sequence. Used mmap and preserved original NPY/JSON.
+
+- At the same target coordinates, mean intensity is 110.915 DN, P2/P98
+  71.177/141.746 DN. Its broad spectral band remains around 0.6-0.8 Hz, with
+  local peaks 0.74/0.60/0.78 Hz. Thirds of the record peak near 0.71/0.60/0.73 Hz.
+- Original 14x14 mean and the larger 32x32 border-corrected sum correlate 0.980.
+  Crop-edge loss is not the main explanation. Nearby rods also have power in
+  this band but do not move in exact brightness synchrony with the target.
+- Correct the short-clip interpretation: over 50 s, raw correlations of target
+  intensity with nearby rod A/B, background and full-frame mean are respectively
+  0.440/0.114/-0.230/-0.257. A simple positive common brightness multiplier is not
+  established. Similar frequency bands alone do not imply identical phase/cause.
+  Background changes are small relative to the rod changes.
+- Exploratory Gaussian fits succeed on all 150 images; median residual RMSE
+  22.19 DN. Fitted X/Y P2-P98 spans 0.65/1.64 raw pixels; neither movement nor
+  width establishes calibrated defocus, physical rotation or mechanical cause.
+- At 3 fps the Nyquist frequency is 1.5 Hz and there are only about 4-5 samples
+  per slow cycle. Each exposure is still only 0.598 ms, not a 333 ms average:
+  faster signals may alias. This dataset cannot independently exclude aliasing
+  or support high-frequency motion analysis.
+
+Saved [spatial plot](runs/datasets/temp/frame_stack_20261002-170258_spatial_analysis.png)
+and [measurement archive](runs/datasets/temp/frame_stack_20261002-170258_spatial_measurements.npz).
+The archive includes extracted intensity/position/width traces and method metadata.
+All files remain local ignored data. No application or hardware changes made.
+
+User proposes official camera app small-area recording. This is a useful independent
+check; current full-frame Fetch frames GUI has no adjustable small-area ROI control.
+Stop acquisition and close Polarcam first to release the camera. Suggested test:
+30-60 s, 50-100 fps if supported, same 0.6 ms exposure/gain 1/stage-off state,
+automatic exposure/gain disabled, native unprocessed frames plus actual settings,
+and ROI covering target, another rod and background. This tests the Polarcam
+application path, not independence from the same camera/driver/SDK or optics.
+
+### Earlier: Full-Frame Spatial Check
+
+User supplied [frame-stack metadata](runs/datasets/temp/frame_stack_20261002-165917.json).
+Read the matching 1,529,927,296-byte NPY using mmap, removing its declared phase
+marker. 150 measurement frames, 2056x2464 uint16, actual 72.175 fps / 597.514 us,
+gains 1, subtraction OFF: only 2.078 s. This cannot establish the slow periodicity
+or compare its frequency reliably with the longer high-FPS diagnostics.
+
+At the previous magnifier crop x=1140:1154, y=696:710, mean is 105.133 DN and
+P2/P98 is 77.738/140.937 DN. A visible spot is still nearby, with fitted mean
+centre (1149.37,703.94), offset toward the crop's right side. A larger 32x32
+aperture at (1134,690), after subtracting each frame's outer-border median,
+still fluctuates strongly: correlation 0.9777 with the original crop, 0.9884
+after seven-frame smoothing. The crop boundary alone does not explain variation.
+
+Exploratory Gaussian+constant fits to 2x2-cell-averaged images give X/Y centre
+P2/P98 ranges 1148.99-1149.78 / 703.28-704.63 raw pixels; fitted sigma ranges
+2.01-2.21 / 2.54-3.03 pixels. These describe image changes, not verified stage
+displacement or calibrated defocus; interference/polarization/shape can bias fits.
+Median fit residual RMSE is 20.39 DN. Do not infer the physical mechanism from it.
+
+Two nearby rod apertures centred approximately (1136,762) and (1086,722) share
+some intensity variation (raw correlations 0.556/0.338 with the target). A nearby
+background box x=1190:1216,y=644:670 has mean 19.414 DN and P2/P98 18.339/20.443,
+raw target correlation 0.597. After seven-frame smoothing, correlations are
+0.754/0.520/0.873 respectively. Short, autocorrelated/smoothed series do not prove
+global illumination modulation; fractional changes differ greatly among regions.
+Shared illumination/optical or imaging effects are plausible, not diagnosed.
+
+Generated [spatial overview](runs/datasets/temp/frame_stack_20261002-165917_spatial_overview.png)
+and [spatial metrics](runs/datasets/temp/frame_stack_20261002-165917_spatial_metrics.png).
+Raw data and sidecars unchanged, no camera operated. Before a longer full-frame
+capture, account for RAM/disk: ten seconds at this rate is approximately 720 frames,
+7.3 GB of uint16 pixels alone; current capture buffers in RAM. Prefer a smaller
+ROI retaining multiple rods/background when available, rather than blindly
+increasing full-frame count. The full-frame capture UI has no new ROI controls.
+
+### Earlier: Matched Same-Rod FPS Pair
+
+Compared the user-labelled recordings
+[1640 request](runs/intensity_diagnostic_20261002-165236_1640.npz) and
+[1400 request](runs/intensity_diagnostic_20261002-165336_1400.npz).
+Verified identical centre (1146.5907, 704.3343), 14x14 analysis crop, 256x14 camera
+ROI at (1140,696), 597.514 us exposure, gains 1 and background OFF. This resolves
+the changed-rod confound in the earlier comparison. Stage remains off per session
+context; hardware state is not independently measured by the recording.
+
+- Actual rates: 1526.403 vs 1401.515 fps; host rates 1526.386 vs 1401.498.
+  46,294 samples / 30.329 s and 41,466 samples / 29.586 s respectively.
+- Both retain a broad 0.6-0.7 Hz intensity oscillation. The faster recording has
+  local peaks near 0.593, 0.659 and 0.725 Hz; the slower recording peaks at 0.642 Hz.
+  Approximately ten-second segments fluctuate between roughly 0.59 and 0.71 Hz.
+  Do not describe the difference in largest whole-file bins as a clean FPS-driven
+  frequency shift: the faster trace itself is spectrally broad/nonstationary.
+- Means 93.352 vs 88.005 DN; P2-P98 spans 63.146 vs 59.714 DN, both about 67.7%
+  of their mean. These spans include fast fluctuations/drift, not just the slow
+  periodic component, and are not interference-suppression scores.
+- GUI delivery age median 4.35/5.29 ms, p99 105.25/96.23 ms, max 154.04/128.69 ms.
+  None exceeds 250 ms; 1.29%/0.75% exceeds 100 ms. Bursts can make the live display
+  jump, but raw/analysed intensity agrees and the mean-intensity spectra agree
+  between frame-order and host-receipt time bases. Intensity/age correlations
+  0.029/-0.043; strongest delay-spectrum peaks differ from the intensity band.
+- No clipping, nonfinite values, non-increasing receipt timestamps, analyser-index
+  gaps, empty complete 10 ms bins or recorded setting-change/error events. Largest
+  receipt intervals 9.26/8.90 ms. These are not hardware frame-loss guarantees.
+
+Saved [comparison plot](runs/intensity_diagnostic_20261002_same_rod_fps_comparison.png).
+The oscillation survives a roughly 125 fps actual-rate change at the same rod and
+exposure, weakening a simple fixed-frequency optical-signal/camera-FPS alias
+explanation. It does not rule out all acquisition/sampling effects or establish
+which physical source is responsible. Nonzero delivery age does not invalidate
+these recordings; host receipt precedes GUI processing but is not sensor timing.
+Next useful evidence is spatially resolved data: a longer raw stack including the
+rod and nearby background, to compare spot displacement/shape with intensities and
+background brightness. Passive mechanics/focus, illumination and camera effects
+remain candidates. No application code/hardware/original recordings changed.
+
+### Follow-Up: 1400 FPS Request
+
+Inspected [runs/intensity_diagnostic_20261002-164736.npz](runs/intensity_diagnostic_20261002-164736.npz)
+after the user changed the FPS request to 1400. Actual readback is 1401.515 fps,
+host receipt rate 1401.497 fps; exposure remains 597.514 us, gains 1, subtraction
+OFF. 28,403 rows span 20.265 s. Raw/analysed means agree; no clipping or recorded
+setting-change events. Strongest mean-intensity peak is 0.691 Hz (1.45 s), present
+in both halves and agreeing between host-bin and frame-order spectra. Maximum
+GUI delay 72.51 ms; intensity/age correlation 0.00079.
+
+Important confound: selected center changed from (1158.29, 580.32) in the 16:42
+recording to (1125.53, 762.83). Mean brightness also differs, 72.73 vs 359.03 DN.
+Do not attribute the peak shift from 0.623 to 0.691 Hz to FPS alone, compare
+suppression amplitudes across these rods, or claim aliasing established/excluded.
+Next comparison should keep this same rod/crop, stage-off condition, exposure and
+gain fixed, return FPS request to 1640 (actual expected near 1526), and record
+20-30 seconds. An A-B-A repeat is preferable if time permits. No hardware changed
+by the assistant; original recordings unchanged.
+
+### Follow-Up: Stage Power Off
+
+The user confirms nothing is driving the stage and its power was turned off for
+the newest recording. Treat this as operator-confirmed equipment state, not merely
+the saved sound checkbox. Inspected
+[runs/intensity_diagnostic_20261002-164221.npz](runs/intensity_diagnostic_20261002-164221.npz):
+19,602 rows over 12.842 s, same 597.514 us / 1526.403 fps settings, gains 1 and
+background OFF. Raw/analysed means agree; no clipping or recorded setting changes.
+
+- Mean intensity still has a strong 0.623 Hz peak (1.605 s), consistent with the
+  previous 0.616 Hz result within the shorter recording's frequency resolution.
+  Both halves show it; host-bin and frame-order spectra agree. The intermediate
+  16:37 recording also peaks near 0.64 Hz at its coarser resolution.
+- Mean 72.733 DN, P2/P98 58.688/89.441 DN (42.28% span relative to mean).
+- X/Y radius is NOT fixed: mean 0.6821, P2/P98 0.6335/0.7310. Correlation with
+  intensity is 0.865 after 10 ms binning; radius shares the 0.623 Hz peak.
+  Phi P2/P98 is -25.62/-9.34 degrees on a continuous branch (modulo 180 deg);
+  phi/intensity binned correlation is 0.451 and phi's strongest peak is near 1 Hz.
+  Do not equate apparent anisotropy-radius changes with proven physical tilt.
+- Complementary sums I0+I90 and I45+I135 fluctuate together, binned correlation
+  0.99905. This is not merely redistribution between polarization channels.
+- GUI age max 81.72 ms, largest receipt gap 6.02 ms; intensity/age correlation
+  0.0235. No evidence for a simple GUI-delay origin, but camera/acquisition or
+  optical sampling effects are not ruled out by a diagnostic of delivered frames.
+
+Saved [intensity/radius/phi/pair-sum plot](runs/intensity_diagnostic_20261002-164221_mean_xy.png).
+The stage-off result disfavors active commanded stage motion, not passive vibration,
+focus/sample motion, illumination/polarization fluctuations, or acquisition effects.
+Normalized X/Y cannot determine absolute brightness: multiplying all four channels
+by the same time-dependent factor leaves X/Y unchanged. Constant-theta phi rotation
+preserves total intensity only under appropriate excitation/collection symmetry;
+the present data do not meet the premise of strictly fixed anisotropy radius.
+Next discriminating test: keep stage power off and exposure fixed at 0.6 ms, change
+only requested FPS (e.g. 1400, verify actual readback), and compare periodicity.
+Then consider spatially resolved stack/reference-region measurements to distinguish
+illumination changes from image/focus motion. No hardware or application code changed.
+
+### Earlier: Longer Diagnostic
+
+On commit 59f62df, inspected the latest diagnostic requested by the user:
+[runs/intensity_diagnostic_20261002-163147.npz](runs/intensity_diagnostic_20261002-163147.npz).
+This is the native magnifier mean, not the new detrended XY residual metric.
+Raw and analysed means are identical (background OFF), 16x16 crop, gains 1,
+597.514 us exposure, 1526.403 fps readback. Manual stop after 48.700 s retained
+74,335 rows. Only the stop event is recorded; no setting changes or errors.
+
+- Strongest mean-intensity spectral peak is about 0.616 Hz (1.62 s period),
+  with a broader band around it rather than a perfectly stable sinusoid.
+  Ten-second sections each peak near 0.6 Hz; the shorter final section peaks
+  at 0.575 Hz at its coarser frequency resolution. Roughly 30 cycles are visible.
+- Mean 139.128 DN; P2/P98 125.444/154.087 DN. Their span is 28.643 DN,
+  20.59% of mean brightness, including drift/noise as well as periodic modulation.
+  No zero/saturated ROI pixels; maximum observed pixel 1448 DN.
+- Hann periodograms with linear detrending agree using frame order at measured
+  mean rate (0.61602 Hz) and 10 ms host-receipt bins (0.61614 Hz). Every complete
+  bin has samples. The oscillation is present before plotting/display reduction.
+- Receipt intervals max 12.55 ms; GUI delay median 8.96 ms, p99 107.65 ms,
+  max 149.29 ms. Brightness/delivery-age correlation is 0.032 (0.036 after
+  10 ms binning); dominant delay-spectrum peaks differ from the intensity peak.
+  These checks do not support a simple GUI-backlog explanation. They cannot
+  exclude SDK/hardware acquisition effects or aliasing of faster optical signals.
+- Consecutive analyser indices are not hardware frame IDs. Generator frequency,
+  Vpp and confirmed drive state are absent. Manual sound_on=false is not proof
+  of physically disabled drive. Do not infer a voltage adjustment direction.
+
+Saved [mean-intensity plot](runs/intensity_diagnostic_20261002-163147_mean_intensity.png)
+beside the unchanged recording. Data/plot remain ignored local files. Next useful
+comparison: confirm actual drive state; record an otherwise matched drive-off/on
+pair via established lab procedure, or a small FPS-only change at fixed exposure
+and drive to test sampling dependence. No camera or application code changed.
+
 ## Lab Session: 2026-10-01
 
 ### Immediate Goal And Stage Boundaries
