@@ -1,0 +1,37 @@
+from pathlib import Path
+import json, numpy as np, cv2, base64, html
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+B=Path(__file__).resolve().parent
+inv=json.loads((B/'inventory.json').read_text());cards=[];(B/'gallery_images').mkdir(exist_ok=True)
+for d in inv:
+ p=Path(d['path']);m=d.get('metadata',{});a=m.get('actual',{});typ=m.get('recording_type','');name=p.name
+ if p.suffix=='.npy' and ('frame_stack' in name or 'spotrec' in name or 'capture_maxfps' in name or 'background_min_' in name or name=='background_profile.npy' or name.startswith('_background_capture_stack')):
+  arr=np.load(p,mmap_mode='r');image=arr if arr.ndim==2 else np.mean(arr[np.linspace(0,max(0,len(arr)-2),5).astype(int)],axis=0)
+  group='September stacks' if '20260918' in name and 'frame_stack' in name else 'September spot recordings' if 'spotrec' in name else 'Background captures and profiles' if 'background' in name else 'October raw recordings'
+  tag=name if name!='capture_maxfps_15x15.npy' else p.parent.name
+  vals=image.astype(np.float32);lo,hi=np.percentile(vals,[5,99.8]);view=np.uint8(np.clip((vals-lo)/max(hi-lo,1)*255,0,255));scale=min(700/view.shape[1],500/view.shape[0]);view=cv2.resize(view,None,fx=scale,fy=scale,interpolation=cv2.INTER_NEAREST)
+  cv2.imwrite(str(B/'gallery_images'/f'{tag}.png'),view)
+  thumb=B/'gallery_images'/f'{tag}.png'
+  fps=a.get('fps');n=a.get('frames');duration=n/fps if n and fps else None
+  timing=a.get('timing',a.get('timing_snapshot',{}));exp=timing.get('exposure_us');gain=a.get('gains',a.get('gains_snapshot',{}))
+  props={'shape':d.get('shape'),'saved dtype':d.get('dtype'),'frames':n,'seconds (fps-based)':round(duration,3) if duration else None,'fps':fps,'exposure us':exp,'analog gain':gain.get('analog',{}).get('val'),'digital gain':gain.get('digital',{}).get('val'),'background already subtracted':m.get('background',{}).get('background_subtracted'),'sound checkbox':m.get('sound',{}).get('sound_on'),'drive declaration':m.get('conditions',{}).get('interference_drive'),'note':m.get('conditions',{}).get('condition_note'),'sensor/crop ROI':m.get('roi'),'display scaling':'5–99.8 percentile, independent per image; not comparable brightness'}
+ elif p.suffix=='.avi':
+  group='October AVI';tag=p.stem;thumb=B/'avi_first_frame.png';props={k:d[k] for k in ['frames','fps','fourcc','shape','min','max']};props['timing']='Header rate only; physical acquisition rate unverified';props['sample']='unknown'
+ elif name.startswith('intensity_diagnostic') and p.suffix=='.npz':
+  group='October diagnostic traces';tag=p.stem;z=np.load(p);s=z['samples'];m=json.loads(str(z['metadata_json']));settings=m['initial_settings'];fig,ax=plt.subplots(figsize=(7,2.5));ax.plot(s[:,0]-s[0,0],s[:,3],lw=.6);ax.set(xlabel='Host receipt time (s)',ylabel='Raw mean DN',title=tag);fig.tight_layout();thumb=B/'gallery_images'/f'{tag}.png';fig.savefig(thumb,dpi=100);plt.close(fig);props={'seconds':round(s[-1,0]-s[0,0],3),'samples':len(s),'settings':settings}
+ else:continue
+ enc=base64.b64encode(thumb.read_bytes()).decode();cards.append({'id':tag,'group':group,'path':str(p),'properties':props,'image':'data:image/png;base64,'+enc})
+(B/'gallery_manifest.json').write_text(json.dumps([{k:v for k,v in c.items() if k!='image'} for c in cards],indent=2))
+body=''
+for c in cards:
+ props=html.escape(json.dumps(c['properties'],indent=2));key=html.escape(c['id'],quote=True)
+ body+=f'''<article data-group="{html.escape(c['group'])}" data-search="{html.escape(c['path'].lower(),quote=True)}"><div class="group">{html.escape(c['group'])}</div><h2>{html.escape(c['id'])}</h2><a href="{c['image']}" target="_blank"><img loading="lazy" src="{c['image']}"></a><p class="path">{html.escape(c['path'])}</p><label>Sample <select data-key="{key}" class="sample"><option>Unknown</option><option>Hinge</option><option>Gold-only</option><option>Background</option><option>Other</option></select></label> <label>Drive <select data-key="{key}" class="drive"><option>Unknown</option><option>Off</option><option>On</option><option>Tuning / changed</option></select></label><textarea data-key="{key}" placeholder="What you remember: field, z scan, pairing, sample, changes..."></textarea><details><summary>Recorded metadata</summary><pre>{props}</pre></details></article>'''
+page='''<!doctype html><html><head><meta charset="utf-8"><title>Polarcam recording gallery — 6 October 2026</title><style>body{font:15px system-ui;background:#edf1f5;color:#172b3d;margin:0}header{padding:24px;background:#123047;color:white;position:sticky;top:0;z-index:2}h1{font-size:25px;margin:0 0 8px}header p{max-width:1100px}button,input,select{padding:8px;border-radius:5px;border:1px solid #bbc9d2}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:18px;padding:20px}article{background:white;padding:18px;border-radius:10px;min-width:0}h2{font-size:16px;overflow-wrap:anywhere}img{width:100%;height:250px;object-fit:contain;background:#101010;image-rendering:auto}.group{color:#276e83;font-weight:bold}.path{font-size:12px;overflow-wrap:anywhere;color:#5c6b78}textarea{display:block;width:97%;height:60px;margin:12px 0;padding:7px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}details{margin-top:10px}.hidden{display:none}</style></head><body><header><h1>Polarcam recording gallery</h1><p>Identify recordings before assigning sample or interference conditions. Each card is one source file; profiles and their source stacks are linked by timestamp, not independent experiments. Images use independent display contrast. Spot recordings are thin hardware crops. Diagnostic files contain traces, not images.</p><input id="q" placeholder="Filter filename or folder" size="35"> <select id="group"><option>All groups</option>GROUP_OPTIONS</select> <button onclick="exportLabels()">Download my labels (JSON)</button><span id="count"></span><p style="font-size:12px">Labels are saved in this browser's local storage when available. Export JSON to preserve/share them. No raw files are changed. September sample identity is user-described hinge; October remains unknown.</p></header><main>CARDS</main><script>
+let labels={};try{labels=JSON.parse(localStorage.getItem('polarcam-gallery-20261006')||'{}')}catch(e){};
+for(const el of document.querySelectorAll('[data-key]')){let k=el.dataset.key;let f=el.tagName==='TEXTAREA'?'note':el.className;if(labels[k]?.[f])el.value=labels[k][f];el.addEventListener('change',()=>{labels[k]??={};labels[k][f]=el.value;try{localStorage.setItem('polarcam-gallery-20261006',JSON.stringify(labels))}catch(e){}})}
+function filter(){let q=document.querySelector('#q').value.toLowerCase(),g=document.querySelector('#group').value,n=0;for(const a of document.querySelectorAll('article')){let show=a.dataset.search.includes(q)&&(g==='All groups'||a.dataset.group===g);a.classList.toggle('hidden',!show);n+=show}document.querySelector('#count').textContent='  '+n+' files'}
+function exportLabels(){let a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(labels,null,2)],{type:'application/json'}));a.download='polarcam_recording_labels.json';a.click();URL.revokeObjectURL(a.href)}document.querySelector('#q').oninput=filter;document.querySelector('#group').onchange=filter;filter();
+</script></body></html>'''.replace('CARDS',body).replace('GROUP_OPTIONS',''.join('<option>'+g+'</option>' for g in sorted(set(c['group'] for c in cards))))
+(B/'recording_gallery.html').write_text(page,encoding='utf-8');print('Gallery:',len(cards),'cards',flush=True)

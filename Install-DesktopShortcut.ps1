@@ -1,5 +1,5 @@
 param(
-    [string]$DataDir = (Join-Path $PSScriptRoot "runs"),
+    [string]$DataDir = (Join-Path $PSScriptRoot "data"),
     [string]$DesktopDir = [Environment]::GetFolderPath("Desktop")
 )
 

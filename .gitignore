@@ -28,3 +28,42 @@ theta_r_curve_parameters/
 
 #temp for testing
 gradient_rods.avi
+
+# Local research data. Track only the catalogue and folder policy, never recordings.
+/data/**
+!/data/README.md
+!/data/catalog.json
+!/data/bfm/
+!/data/bfm/README.md
+
+# Analysis source is versioned; generated results, private sources and runtimes are not.
+/analysis/**
+!/analysis/**/
+!/analysis/**/*.py
+!/analysis/**/*.ipynb
+!/analysis/**/*.mplstyle
+!/analysis/**/requirements.txt
+!/analysis/README.md
+/analysis/**/__pycache__/
+/analysis/**/.ipynb_checkpoints/
+/analysis/**/runtime/
+/analysis/**/source_review/
+/analysis/**/executed_notebooks/
+/analysis/**/make_report.py
+/analysis/**/make_review.py
+/analysis/**/make_readout.py
+/analysis/**/check_delivery.py
+/analysis/**/original_scripts/*
+!/analysis/**/original_scripts/hinge_analysis.py
+!/analysis/**/original_scripts/Framestack_theta_survey.ipynb
+!/analysis/**/original_scripts/Unit_sphere_viewer.ipynb
+# Report builders are local narrative snapshots, not the maintained analysis pipeline.
+
+# Acquisition products accidentally written outside data/.
+*.npy
+*.npz
+*.tdms
+*.tdms_index
+*.avi
+*.stop
+*.import-partial

@@ -8,7 +8,7 @@ if not exist "%~dp0.venv\Scripts\python.exe" (
     exit /b 1
 )
 set "PYTHONUNBUFFERED=1"
-"%~dp0.venv\Scripts\python.exe" -u -m polarcam --data-dir "%~dp0runs" %*
+"%~dp0.venv\Scripts\python.exe" -u -m polarcam --data-dir "%~dp0data" %*
 set "RESULT=%ERRORLEVEL%"
 if not "%RESULT%"=="0" (
     echo.

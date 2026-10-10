@@ -1,4 +1,4 @@
-*# Polarcam
+# Polarcam
 
 Live polarization-camera acquisition and spot analysis. The maintained application
 is Hugh Bowman's Polarcam Live implementation, imported from Polarcam_v3 as a
@@ -23,7 +23,7 @@ For desktop launch, machine setup, and the staged lab acceptance checklist, see
 [LAB_SETUP.md](LAB_SETUP.md). [Launch-Polarcam.cmd](Launch-Polarcam.cmd) opens the
 application with this checkout's `.venv`; run
 [Install-DesktopShortcut.ps1](Install-DesktopShortcut.ps1) to create **Polarcam Lab**
-on the Windows desktop. Its default data directory is this repository's `runs/`.
+on the Windows desktop. Its default data directory is this repository's `data/`.
 
 Use Python 3.12.10 or later with Tk support. From the repository root on Windows:
 
@@ -31,7 +31,7 @@ Use Python 3.12.10 or later with Tk support. From the repository root on Windows
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e .
-python -m polarcam --data-dir .\runs
+python -m polarcam --data-dir .\data
 ```
 
 `polarcam` and `polarcam-gui` launch the same live application. The launcher starts
@@ -147,3 +147,12 @@ exit status. Regression tests use synthetic recordings and fake cameras to cover
 FPS/marker handling, capture errors and inactivity, and analysis-worker shutdown.
 These checks do not establish camera timing, hardware behavior, or scientific
 parity with the lab installation; those require separate validation.
+
+## Research workspace
+
+Local recordings and imports are organised under [data/](data/README.md), split
+by hinge/BFM experiment and camera/APD detector. Dated analysis projects are under
+[analysis/](analysis/README.md). Only code, clean notebook inputs and documentation
+are versioned; raw data, outputs and private correspondence are ignored.
+The former root intensity diagnostic is preserved under
+`data/hinges/polarcam/legacy_workspace_runs/`.

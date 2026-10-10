@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "datasets": {
+    "hinge_camera_export": "hinges/polarcam/import_2026-10-09",
+    "hinge_camera_september": "hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh",
+    "hinge_camera_runs": "hinges/polarcam/import_2026-10-09/runs",
+    "hinge_apd": "hinges/apd_polarcam/legacy_hugh/Hinge apd recordings, 2 strand + notches",
+    "legacy_workspace_runs": "hinges/polarcam/legacy_workspace_runs"
+  },
+  "note": "Paths relative to data/. Imported file metadata is unmodified; sample/control identity must be confirmed from acquisition records."
+}

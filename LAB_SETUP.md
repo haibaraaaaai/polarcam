@@ -8,7 +8,10 @@ directly. This launches the actual application, not the angle-analysis tool. It
 does not automatically start camera acquisition. A diagnostic console stays open
 while the app runs; if startup fails, retain its error text before closing it.
 
-Recordings and active backgrounds default to `runs/` inside the repository.
+Recordings and active backgrounds default to `data/` inside the repository.
+The 10 October reorganisation moved local historical `runs/` into
+`data/hinges/polarcam/legacy_workspace_runs/`. Older entries below describe the
+paths used at the time; see `data/README.md` for current locations.
 Use an explicit data folder on a suitable local disk for experiments. Do not use
 Hugh's working installation or its data directory for these initial tests.
 The working directory controls relative output, but file dialogs can choose other
