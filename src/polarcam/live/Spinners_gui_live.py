@@ -428,6 +428,12 @@ class BasicVideoPlayer:
         )
         if offset:
             centers = [(cx + offset, cy + offset) for (cx, cy) in centers]
+        edits = self._manual_spot_edits.get(str(self.video_path), {})
+        removed = edits.get("removed", [])
+        centers = [p for p in centers if not any(np.hypot(p[0]-q[0], p[1]-q[1]) < 3 for q in removed)]
+        for point in edits.get("added", []):
+            if not any(np.hypot(point[0]-p[0], point[1]-p[1]) < 3 for p in centers):
+                centers.append(point)
         return centers
 
     def _show_st2_popup(self, s_map: np.ndarray):
@@ -539,6 +545,10 @@ class BasicVideoPlayer:
 
         if abs_enabled:
             keep = [i for i in keep if self._spot_xy_max_axis_range(xy_all[i]) > abs_thr]
+
+        manual = self._manual_spot_edits.get(str(self.video_path), {}).get("added", [])
+        keep = sorted(set(keep) | {i for i, p in enumerate(centers_all)
+                                  if any(np.hypot(p[0]-q[0], p[1]-q[1]) < 3 for q in manual)})
 
         prev_n = len(centers_all)
         if not keep:
@@ -1470,6 +1480,13 @@ class BasicVideoPlayer:
         self._capture_role_var = tk.StringVar(value="Sample")
         self._interference_state_var = tk.StringVar(value="Unknown")
         self._capture_condition_note_var = tk.StringVar(value="")
+        self._experiment_var = tk.StringVar(value="hinges")
+        self._experiment_kind = "hinges"
+        self._session_id = time.strftime("%Y-%m-%d_%H%M%S")
+        self._session_root_override = None
+        self._manual_spot_edits = {}
+        self._manual_add_armed = False
+        self._capture_conditions_cache = {}
         self._source_recording_metadata = []
         self._source_phase = {}
         self._intensity_channels = None
@@ -1504,15 +1521,9 @@ class BasicVideoPlayer:
         self._background_profile = None
         self._background_profile_path = None
         self._background_profile_info_var = tk.StringVar(value="Background profile: stored average")
-        self._fetch_save_dir_override: Optional[Path] = (
-            Path.cwd() / self.CAPTURE_DEFAULT_SAVE_DIRNAME
-        )
-        self._stationary_save_dir_override: Optional[Path] = (
-            Path.cwd() / self.CAPTURE_DEFAULT_SAVE_DIRNAME
-        )
-        self._spotrec_save_dir_override: Optional[Path] = (
-            Path.cwd() / self.CAPTURE_DEFAULT_SAVE_DIRNAME
-        )
+        self._fetch_save_dir_override: Optional[Path] = None
+        self._stationary_save_dir_override: Optional[Path] = None
+        self._spotrec_save_dir_override: Optional[Path] = None
         self._fetch_save_dir_var = tk.StringVar(value="")
         self._stationary_save_dir_var = tk.StringVar(value="")
         self._spotrec_save_dir_var = tk.StringVar(value="")
@@ -1521,8 +1532,10 @@ class BasicVideoPlayer:
         # Fetch-frames controls
         self._fetch_busy = False
         self._fetch_sync_lock = False
-        self._fetch_exp_ms_var = tk.StringVar(value="1.2")
-        self._fetch_gain_analog_var = tk.StringVar(value="1.0")
+        self._camera_exp_ms_var = tk.StringVar(value="0.6")
+        self._camera_gain_var = tk.StringVar(value="20")
+        self._fetch_exp_ms_var = self._camera_exp_ms_var
+        self._fetch_gain_analog_var = self._camera_gain_var
         self._fetch_fps_var = tk.StringVar(value="78")
         self._fetch_n_var = tk.StringVar(value="150")
         self._fetch_dur_var = tk.StringVar(value="")
@@ -1627,10 +1640,10 @@ class BasicVideoPlayer:
         self._spotrec_out_path = None
         self._spotrec_roi_meta = None
         self._spotrec_fps_var = tk.StringVar(value="2000")
-        self._spotrec_exp_ms_var = tk.StringVar(value="1.2")
-        self._spotrec_gain_analog_var = tk.StringVar(value="1.0")
+        self._spotrec_exp_ms_var = self._camera_exp_ms_var
+        self._spotrec_gain_analog_var = self._camera_gain_var
         self._spotrec_background_subtract_var = tk.BooleanVar(value=False)
-        self._spotrec_size_var = tk.StringVar(value="11")
+        self._spotrec_size_var = tk.StringVar(value="14")
         self._spotrec_spot_var = tk.StringVar(value="Spot - / -")
         self._spotrec_status_var = tk.StringVar(value="Idle")
         self._spotrec_progress_var = tk.StringVar(value="")
@@ -1665,8 +1678,8 @@ class BasicVideoPlayer:
         self._spotrec_hand_ref = None
         self._live_start_btn = None
         self._live_stop_btn = None
-        self._live_exp_ms_var = tk.StringVar(value="1.2")
-        self._live_gain_var = tk.StringVar(value="1.0")
+        self._live_exp_ms_var = self._camera_exp_ms_var
+        self._live_gain_var = self._camera_gain_var
         self._live_status_var = tk.StringVar(value="Live feed stopped")
         self._live_theta_var = tk.StringVar(value="")
         self._live_mag_enabled_var = tk.BooleanVar(value=False)
@@ -1682,6 +1695,7 @@ class BasicVideoPlayer:
         self._live_display_stretch_lo_scale = None
         self._live_display_stretch_hi_scale = None
         self._live_xy_mode_var = tk.StringVar(value="Live XY (magnifier center)")
+        self._live_trace_mode_var = tk.StringVar(value="Mean intensity")
         self._live_zoom_var = tk.StringVar(value="8.0")
         self._live_zoom_center = None  # (x,y) in source frame pixels
         self._live_zoom_center_var = tk.StringVar(value="Centre pixel: -")
@@ -1700,12 +1714,8 @@ class BasicVideoPlayer:
         self._live_capture_status_var = tk.StringVar(value="Live stationary capture idle.")
         self._live_capture_lock = threading.Lock()
         self._live_capture_running = False
-        self._live_capture_exp_ms_var = tk.StringVar(
-            value=f"{self.LIVE_STATIONARY_CAPTURE_EXP_MS:.3f}"
-        )
-        self._live_capture_gain_analog_var = tk.StringVar(
-            value=f"{self.LIVE_STATIONARY_CAPTURE_GAIN_ANALOG:.2f}"
-        )
+        self._live_capture_exp_ms_var = self._camera_exp_ms_var
+        self._live_capture_gain_analog_var = self._camera_gain_var
         self._live_capture_gain_digital_var = tk.StringVar(
             value=f"{self.LIVE_STATIONARY_CAPTURE_GAIN_DIGITAL:.2f}"
         )
@@ -1805,18 +1815,14 @@ class BasicVideoPlayer:
         )
         self._stationary_prev_btn = None
         self._stationary_next_btn = None
-        self._stationary_capture_max_exp_ms_var = tk.StringVar(
-            value=f"{self.STATIONARY_REC_MAX_EXP_MS_DEFAULT:.3f}"
-        )
+        self._stationary_capture_max_exp_ms_var = self._camera_exp_ms_var
         self._stationary_capture_max_duration_s_var = tk.StringVar(
             value=f"{self.STATIONARY_REC_MAX_DURATION_S_DEFAULT:.2f}"
         )
         self._stationary_capture_max_fps_est_var = tk.StringVar(
             value=f"{self.STATIONARY_REC_MAX_FPS_EST_DEFAULT:.1f}"
         )
-        self._stationary_capture_gain_analog_var = tk.StringVar(
-            value=f"{self.STATIONARY_REC_GAIN_DEFAULT:.2f}"
-        )
+        self._stationary_capture_gain_analog_var = self._camera_gain_var
         self._stationary_capture_background_subtract_var = tk.BooleanVar(value=False)
         self._stationary_capture_status_var = tk.StringVar(value="Stationary capture idle.")
         self._stationary_capture_running = False
@@ -1890,10 +1896,14 @@ class BasicVideoPlayer:
         self.frame_q = queue.Queue(maxsize=16)
 
         self._build_ui()
+        for variable in (self._capture_role_var, self._interference_state_var,
+                         self._capture_condition_note_var, self._detection_mode_var):
+            variable.trace_add("write", lambda *_: self._sync_capture_conditions())
+        self._sync_capture_conditions()
         self._refresh_save_dir_labels()
         self._update_spotrec_label()
         self._start_ui_pump()
-        self._spotrec_size_var.trace_add("write", lambda *_: self._spotrec_update_preview())
+        self._spotrec_size_var.trace_add("write", lambda *_: self._spotrec_update_preview(gray_frame=self._live_last_frame))
         self._stationary_review_include_var.trace_add(
             "write", lambda *_: self._on_stationary_review_include_toggle()
         )
@@ -1904,13 +1914,25 @@ class BasicVideoPlayer:
     def _build_ui(self) -> None:
         global_bar = ttk.Frame(self.root, padding=(8, 6, 8, 2))
         global_bar.pack(side=tk.TOP, fill=tk.X)
-        ttk.Checkbutton(
-            global_bar,
-            text="Sound on / vibrating",
-            variable=self._sound_on_var,
-        ).pack(side=tk.LEFT)
+        ttk.Label(global_bar, text="Experiment").pack(side=tk.LEFT)
+        experiment = ttk.Combobox(global_bar, textvariable=self._experiment_var,
+                                 values=("hinges", "bfm"), state="readonly", width=8)
+        experiment.pack(side=tk.LEFT, padx=4)
+        experiment.bind("<<ComboboxSelected>>", self._change_experiment)
+        ttk.Button(global_bar, text="Session folder…", command=self._choose_session_dir).pack(side=tk.LEFT, padx=6)
+        ttk.Label(global_bar, text="Drive (manual)").pack(side=tk.LEFT)
+        ttk.Combobox(global_bar, textvariable=self._interference_state_var,
+                     values=("Unknown", "On", "Off"), state="readonly", width=8).pack(side=tk.LEFT)
+        ttk.Label(global_bar, text="Recording").pack(side=tk.LEFT, padx=6)
+        ttk.Combobox(global_bar, textvariable=self._capture_role_var,
+                     values=("Sample", "Hinge", "Gold-only control", "BFM", "Background", "Other"),
+                     state="readonly", width=16).pack(side=tk.LEFT)
         ttk.Button(global_bar, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.LEFT, padx=(12, 0))
 
+        notes = ttk.Frame(self.root, padding=(8, 0, 8, 4))
+        notes.pack(fill=tk.X)
+        ttk.Label(notes, text="Sample / illumination / pair ID / notes (saved with captures)").pack(side=tk.LEFT)
+        ttk.Entry(notes, textvariable=self._capture_condition_note_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         notebook = ttk.Notebook(self.root)
         notebook.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self._notebook = notebook
@@ -2006,6 +2028,18 @@ class BasicVideoPlayer:
         )
         self._live_zoom_label = tk.Label(right, bg="black")
         self._live_zoom_label.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        trace_controls = ttk.Frame(right)
+        trace_controls.pack(fill=tk.X)
+        ttk.Label(trace_controls, text="Time trace").pack(side=tk.LEFT)
+        ttk.Combobox(trace_controls, textvariable=self._live_trace_mode_var,
+                     values=("Mean intensity", "X anisotropy", "Y anisotropy"),
+                     state="readonly", width=18).pack(side=tk.LEFT)
+        roi_controls = ttk.Frame(right)
+        roi_controls.pack(fill=tk.X)
+        ttk.Label(roi_controls, text="ROI sensor px (even)").pack(side=tk.LEFT)
+        ttk.Entry(roi_controls, textvariable=self._live_capture_roi_var, width=5).pack(side=tk.LEFT)
+        ttk.Button(roi_controls, text="Apply ROI/settings", command=self._apply_magnifier_roi).pack(side=tk.LEFT)
+        ttk.Button(right, text="Use magnifier centre for Spot examine", command=self._use_live_spot).pack(anchor="w")
         ttk.Label(right, textvariable=self._live_zoom_center_var, justify=tk.LEFT).pack(
             side=tk.TOP, anchor="w", pady=(4, 0)
         )
@@ -2159,14 +2193,7 @@ class BasicVideoPlayer:
         ttk.Label(conditions, text="Detection").pack(side=tk.LEFT)
         ttk.Combobox(conditions, textvariable=self._detection_mode_var, values=("Time variation", "Intensity"),
                  state="readonly", width=15).pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Label(conditions, text="Recording").pack(side=tk.LEFT)
-        ttk.Combobox(conditions, textvariable=self._capture_role_var, values=("Sample", "Background"),
-                 state="readonly", width=12).pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Label(conditions, text="Interference drive (manual)").pack(side=tk.LEFT)
-        ttk.Combobox(conditions, textvariable=self._interference_state_var, values=("Unknown", "On", "Off"),
-                 state="readonly", width=9).pack(side=tk.LEFT, padx=(6, 12))
-        ttk.Label(conditions, text="Condition note").pack(side=tk.LEFT)
-        ttk.Entry(conditions, textvariable=self._capture_condition_note_var, width=24).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+        ttk.Label(conditions, text="Exposure/gain and recording conditions are shared across tabs.").pack(side=tk.LEFT, padx=12)
         ttk.Label(parent, textvariable=self._fetch_save_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
             side=tk.TOP, anchor="w", fill=tk.X
         )
@@ -2228,6 +2255,10 @@ class BasicVideoPlayer:
         ttk.Label(nav, textvariable=self._spot_status_var).pack(side=tk.LEFT, padx=(8, 0))
         self._spot_play_btn = ttk.Button(nav, text="Play spot", command=self._open_spot_playback)
         self._spot_play_btn.pack(side=tk.RIGHT)
+        edits = ttk.Frame(controls)
+        edits.pack(fill=tk.X, pady=4)
+        ttk.Button(edits, text="Add spot: click map", command=self._arm_add_spot).pack(side=tk.LEFT)
+        ttk.Button(edits, text="Remove selected", command=self._remove_manual_spot).pack(side=tk.LEFT, padx=4)
 
         params = ttk.Frame(controls)
         params.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
@@ -2435,13 +2466,13 @@ class BasicVideoPlayer:
         self._stationary_review_next_btn.pack(side=tk.LEFT, padx=(4, 8))
         self._stationary_review_mark_chk = ttk.Checkbutton(
             nav,
-            text="Good enough (tick to move into good folder)",
+            text="Accept manually (moves to good; not automatic QC)",
             variable=self._stationary_review_include_var,
         )
         self._stationary_review_mark_chk.pack(side=tk.LEFT)
         self._stationary_review_bad_btn = ttk.Button(
             nav,
-            text="Reject / move to bad",
+            text="Reject manually (keeps files in bad)",
             command=self._stationary_review_mark_current_bad,
         )
         self._stationary_review_bad_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -3107,24 +3138,54 @@ class BasicVideoPlayer:
         self._select_stationary_spot((int(self._stationary_idx) + 1) % len(self._stationary_candidates))
 
     def _recordings_day_dir(self) -> Path:
-        day = time.strftime("%Y-%m-%d")
-        out = Path.cwd() / self.RECORDINGS_ROOT_DIRNAME / day
+        out = self._session_dir()
         out.mkdir(parents=True, exist_ok=True)
         return out
 
+    def _session_dir(self) -> Path:
+        out = (Path(self._session_root_override) if self._session_root_override is not None
+               else Path.cwd() / self._experiment_kind / "polarcam" / self._session_id)
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def _acquisition_busy(self) -> bool:
+        return bool(self._fetch_busy or self._spotrec_running or self._spotrec_proc is not None
+                    or self._live_capture_running or self._stationary_capture_running
+                    or self._live_intensity_running)
+
+    def _change_experiment(self, _event=None) -> None:
+        if self._acquisition_busy():
+            self._experiment_var.set(self._experiment_kind)
+            messagebox.showinfo("Session", "Stop recording/analysis before changing experiment.")
+            return
+        self._experiment_kind = self._experiment_var.get()
+        self._session_root_override = None
+        self._sync_capture_conditions()
+        self._refresh_save_dir_labels()
+
+    def _choose_session_dir(self) -> None:
+        if self._acquisition_busy():
+            messagebox.showinfo("Session", "Stop recording/analysis before changing the session folder.")
+            return
+        path = filedialog.askdirectory(title="Choose one session folder for all recording types",
+                                       initialdir=str(self._session_dir()))
+        if path:
+            self._session_root_override = Path(path)
+            self._sync_capture_conditions()
+            self._refresh_save_dir_labels()
+
     def _stationary_dataset_root_dir(self) -> Path:
-        base = self._stationary_save_dir_override
-        out = Path(base) if base is not None else (Path.cwd() / self.STATIONARY_DATASET_DIRNAME)
+        out = self._session_dir() / "stationary"
         out.mkdir(parents=True, exist_ok=True)
         return out
 
     def _fetch_save_dir(self) -> Path:
-        out = Path(self._fetch_save_dir_override) if self._fetch_save_dir_override is not None else (Path.cwd() / self.INFILL_TRAINING_STACKS_DIR)
+        out = self._session_dir() / "frames"
         out.mkdir(parents=True, exist_ok=True)
         return out
 
     def _spotrec_save_dir(self) -> Path:
-        out = Path(self._spotrec_save_dir_override) if self._spotrec_save_dir_override is not None else self._recordings_subdir(self.RECORDINGS_SPOT_DIRNAME)
+        out = self._session_dir() / "spots"
         out.mkdir(parents=True, exist_ok=True)
         return out
 
@@ -3143,25 +3204,13 @@ class BasicVideoPlayer:
             self._spotrec_save_dir_var.set("Save: -")
 
     def _choose_fetch_save_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose fetch-frames save folder", initialdir=str(self._datasets_initial_dir()))
-        if not path:
-            return
-        self._fetch_save_dir_override = Path(path)
-        self._refresh_save_dir_labels()
+        self._choose_session_dir()
 
     def _choose_stationary_save_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose stationary recordings save root", initialdir=str(self._datasets_initial_dir()))
-        if not path:
-            return
-        self._stationary_save_dir_override = Path(path)
-        self._refresh_save_dir_labels()
+        self._choose_session_dir()
 
     def _choose_spotrec_save_dir(self) -> None:
-        path = filedialog.askdirectory(title="Choose spot recording save folder", initialdir=str(self._datasets_initial_dir()))
-        if not path:
-            return
-        self._spotrec_save_dir_override = Path(path)
-        self._refresh_save_dir_labels()
+        self._choose_session_dir()
 
     def _recordings_subdir(self, kind: str) -> Path:
         out = self._recordings_day_dir() / str(kind)
@@ -3193,20 +3242,30 @@ class BasicVideoPlayer:
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
 
-    def _sound_metadata(self) -> dict:
-        return {
-            "sound_on": bool(self._sound_on_var.get()),
-            "source": "manual_gui_checkbox",
-        }
-
-    def _capture_conditions(self) -> dict:
-        return {
+    def _sync_capture_conditions(self) -> None:
+        state = self._interference_state_var.get()
+        self._sound_on_var.set(state == "On")  # compatibility for existing diagnostic code
+        self._capture_conditions_cache = {
             "recording_role": self._capture_role_var.get(),
-            "interference_drive": self._interference_state_var.get(),
+            "interference_drive": state,
             "condition_note": self._capture_condition_note_var.get().strip(),
+            "experiment": self._experiment_kind,
+            "session_id": self._session_id,
             "source": "manual_operator_declaration_not_hardware_readback",
             "detector": self._detection_mode_var.get(),
         }
+
+    def _sound_metadata(self) -> dict:
+        conditions = self._capture_conditions()
+        state = conditions.get("interference_drive", "Unknown")
+        return {
+            "sound_on": True if state == "On" else False if state == "Off" else None,
+            "source": "shared_manual_drive_declaration_not_hardware_readback",
+            "conditions_at_start": conditions,
+        }
+
+    def _capture_conditions(self) -> dict:
+        return dict(self._capture_conditions_cache)
 
     def _background_metadata(
         self,
@@ -3243,12 +3302,16 @@ class BasicVideoPlayer:
         extra: Optional[dict] = None,
     ) -> Path:
         p = Path(npy_path)
+        sound = dict(sound or self._sound_metadata())
         payload = {
+            "schema_version": 2,
+            "conditions": dict(sound.get("conditions_at_start", {})),
+            "review": {"status": "unreviewed", "source": "no_automatic_quality_classification"},
             "created_local": time.strftime("%Y-%m-%d %H:%M:%S"),
             "recording_type": str(recording_type),
             "npy_file": p.name,
             "npy_path": str(p),
-            "sound": dict(sound or self._sound_metadata()),
+            "sound": sound,
             "requested": dict(requested or {}),
             "actual": dict(actual or {}),
             "background": dict(background or self._background_metadata(False, actual=False, profile_path=None)),
@@ -4472,6 +4535,7 @@ class BasicVideoPlayer:
             dst = good_dir / f"{src.name}_{time.time_ns()}"
         try:
             shutil.move(str(src), str(dst))
+            self._write_json_atomic(dst / "review.json", {"status": "accepted", "source": "manual_operator", "reviewed_local": time.strftime("%Y-%m-%d %H:%M:%S")})
             self.bottom_var.set(f"Moved to good: {dst.name}")
         except Exception as e:
             messagebox.showerror("Stationary review", f"Could not move folder: {e}")
@@ -4495,6 +4559,7 @@ class BasicVideoPlayer:
             dst = bad_dir / f"{src.name}_{time.time_ns()}"
         try:
             shutil.move(str(src), str(dst))
+            self._write_json_atomic(dst / "review.json", {"status": "rejected", "source": "manual_operator", "reviewed_local": time.strftime("%Y-%m-%d %H:%M:%S")})
             self.bottom_var.set(f"Moved to bad: {dst.name}")
         except Exception as e:
             messagebox.showerror("Stationary review", f"Could not move folder: {e}")
@@ -4664,6 +4729,9 @@ class BasicVideoPlayer:
                 pass
 
     def _apply_live_settings(self) -> None:
+        if self._live_intensity_running:
+            self._apply_magnifier_roi()
+            return
         if not self._live_controller:
             return
         exp_ms = self._parse_float(self._live_exp_ms_var.get())
@@ -4787,7 +4855,7 @@ class BasicVideoPlayer:
             xv, yv, _ = self._xy_phi_from_frame(
                 gray=np.asarray(frame),
                 roi_meta=None,
-                win_raw=int(self.STATIONARY_REC_MAX_ROI_RAW),
+                win_raw=self._normalised_roi_size(self._live_capture_roi_var.get()),
                 center=(cx, cy),
             )
         except Exception:
@@ -5569,8 +5637,12 @@ class BasicVideoPlayer:
             t_s = float(received_at) - self._live_intensity_started_at
             self._live_intensity_frame_i += 1
             cutoff = t_s - float(self._live_intensity_window_s)
+            grids = roi_channel_means(square, origin[0] % 2, origin[1] % 2)
+            c0, c90, c45, c135 = [float(np.mean(g, dtype=np.float64)) for g in grids]
+            ax = (c0-c90)/(c0+c90) if c0+c90 > 0 else float("nan")
+            ay = (c45-c135)/(c45+c135) if c45+c135 > 0 else float("nan")
             with self._live_intensity_lock:
-                self._live_intensity_buffer.append((t_s, val))
+                self._live_intensity_buffer.append((t_s, val, ax, ay))
                 while self._live_intensity_buffer and float(self._live_intensity_buffer[0][0]) < cutoff:
                     self._live_intensity_buffer.popleft()
             if (now - float(self._live_intensity_last_preview_ts)) >= float(
@@ -5653,7 +5725,13 @@ class BasicVideoPlayer:
                 draw.text((45, 70), "No intensity data", fill=(80, 80, 80))
             else:
                 t = np.asarray([p[0] for p in data], dtype=np.float64)
-                y = np.asarray([p[1] for p in data], dtype=np.float64)
+                mode = self._live_trace_mode_var.get()
+                column = {"Mean intensity": 1, "X anisotropy": 2, "Y anisotropy": 3}[mode]
+                y = np.asarray([p[column] for p in data], dtype=np.float64)
+                units = "DN" if column == 1 else "dimensionless"
+                if not np.isfinite(y).any():
+                    self._live_intensity_status_var.set("No valid channel pair sums for this trace.")
+                    return
                 if Figure is not None and FigureCanvas is not None:
                     if self._live_intensity_figure is None:
                         self._live_intensity_figure = Figure(figsize=(3.0, 1.7), dpi=100)
@@ -5668,9 +5746,11 @@ class BasicVideoPlayer:
                         self._live_intensity_axis.grid(alpha=0.25)
                         self._live_intensity_figure.subplots_adjust(left=0.21, bottom=0.26, right=0.96, top=0.83)
                     ax = self._live_intensity_axis
+                    ax.set_ylabel(f"{mode} ({units})", fontsize=7)
+                    ax.set_title(f"{mode}, last 10 s", fontsize=8)
                     self._live_intensity_line.set_data(*display_envelope(t - float(t[-1]), y, columns=300))
                     ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
-                    if self._intensity_tuner.reference is not None:
+                    if column == 1 and self._intensity_tuner.reference is not None:
                         reference_stats = self._intensity_tuner.reference["stats"]
                         ymin, ymax = reference_stats["p02"], reference_stats["p98"]
                     if ymax <= ymin:
@@ -5700,10 +5780,10 @@ class BasicVideoPlayer:
                         draw.line(pts, fill=(11, 79, 138), width=1)
                     draw.text((45, 2), "Live intensity, last 10 s", fill=(0, 0, 0))
                 if y.size >= 2:
-                    p2, p98 = np.percentile(y, [2, 98])
+                    p2, p98 = np.nanpercentile(y, [2, 98])
                     fps = float(self._live_intensity_fps) if self._live_intensity_fps else 0.0
                     self._live_intensity_status_var.set(
-                        f"{len(y)} samples | fps {fps:.1f} | p98-p2 {float(p98 - p2):.2f} DN"
+                        f"{len(y)} samples | fps {fps:.1f} | p98-p2 {float(p98 - p2):.3f} {units}"
                     )
             photo = ImageTk.PhotoImage(img)
             self._live_intensity_plot_label.configure(image=photo)
@@ -6246,6 +6326,9 @@ class BasicVideoPlayer:
                 if abs(float(fx) - float(fcx)) > 2.0 or abs(float(fy) - float(fcy)) > 2.0:
                     self._live_clear_captured_xy_freeze()
             self._set_live_zoom_center((float(fx), float(fy)), reset_xy=True)
+            self._set_selected_center_override((float(fx), float(fy)), source="manual live")
+            self._spotrec_center_offset = (0, 0)
+            self._update_spotrec_label()
         except Exception:
             return
 
@@ -6332,141 +6415,46 @@ class BasicVideoPlayer:
         if self._spotrec_preview_label is None:
             return
         center = self._get_selected_spot_center(tracked=False)
-        if center is None:
+        source = gray_frame
+        if source is None and not self._spotrec_running:
+            source = self._live_last_frame if self._live_running else self._intensity_mean_frame
+        if source is None and not self._spotrec_running and self.npy_frames is not None:
+            source = self.npy_frames[0] if self.npy_has_frames_dim else self.npy_frames
+        if center is None or source is None:
             self._spotrec_preview_label.configure(image="")
             return
-        cx, cy = center
-
-        base_win = int(self._spotrec_preview_size)
-        src = gray_frame if (gray_frame is not None and getattr(gray_frame, "ndim", 0) == 2) else None
-        if src is None:
-            self._spotrec_preview_label.configure(image="")
-            return
-        # If preview frames come from a ROI capture, convert full-res center to ROI-local coords.
-        if self._spotrec_running and gray_frame is not None:
-            meta = getattr(self, "_spotrec_roi_meta", None)
-            if isinstance(meta, dict):
-                try:
-                    rx = float(meta.get("x", 0))
-                    ry = float(meta.get("y", 0))
-                    cx = float(cx) - rx
-                    cy = float(cy) - ry
-                    h_src, w_src = src.shape
-                    if cx < 0.0 or cy < 0.0 or cx >= float(w_src) or cy >= float(h_src):
-                        self._spotrec_preview_label.configure(image="")
-                        return
-                except Exception:
-                    pass
-            # During recording: crop (n-1)x(n-1) around the ROI-local spot, then place it on a
-            # fixed 18x18 canvas at the start-record red-box offset (not always centered).
-            try:
-                req_n = int(self._parse_int(self._spotrec_size_var.get()) or 7)
-                req_n = max(1, int(req_n))
-                crop_n = max(1, int(req_n - 1))
-                h_src, w_src = src.shape
-                crop_n = min(crop_n, int(min(h_src, w_src)))
-                if crop_n < 1:
-                    self._spotrec_preview_label.configure(image="")
-                    return
-                crop = self._extract_window(src, cx, cy, crop_n)
-                target_n = 18
-                canvas = np.zeros((target_n, target_n), dtype=crop.dtype)
-                off_x_anchor = int(round(self._spotrec_center_offset[0]))
-                off_y_anchor = int(round(self._spotrec_center_offset[1]))
-                if isinstance(meta, dict):
-                    try:
-                        off_x_anchor = int(round(float(meta.get("off_x_start", off_x_anchor))))
-                        off_y_anchor = int(round(float(meta.get("off_y_start", off_y_anchor))))
-                    except Exception:
-                        pass
-                half_t = target_n // 2
-                anchor_x = half_t + off_x_anchor
-                anchor_y = half_t + off_y_anchor
-                x0 = int(round(anchor_x - (crop_n // 2)))
-                y0 = int(round(anchor_y - (crop_n // 2)))
-                x1 = x0 + crop_n
-                y1 = y0 + crop_n
-
-                dst_x0 = max(0, x0)
-                dst_y0 = max(0, y0)
-                dst_x1 = min(target_n, x1)
-                dst_y1 = min(target_n, y1)
-                if dst_x1 <= dst_x0 or dst_y1 <= dst_y0:
-                    self._spotrec_preview_label.configure(image="")
-                    return
-                src_x0 = max(0, -x0)
-                src_y0 = max(0, -y0)
-                src_x1 = src_x0 + (dst_x1 - dst_x0)
-                src_y1 = src_y0 + (dst_y1 - dst_y0)
-                canvas[dst_y0:dst_y1, dst_x0:dst_x1] = crop[src_y0:src_y1, src_x0:src_x1]
-                window = canvas
-                win = int(window.shape[0])
-            except Exception:
-                window = self._extract_window(src, cx, cy, base_win)
-                win = int(base_win)
-        else:
-            window = self._extract_window(src, cx, cy, base_win)
-            win = int(base_win)
-        # Stronger contrast stretch for very dim live frames.
-        u8 = detect_spinners.to_u8_preview(window, lo_pct=0.0, hi_pct=99.5)
-
-        roi = self._parse_int(self._spotrec_size_var.get()) or 7
-        roi = max(1, int(roi))
-        if self._spotrec_running and gray_frame is not None:
-            roi = max(1, int(roi - 1))
-        elif roi % 2 == 0:
-            roi += 1
-        if roi > win:
-            roi = win
-        half_roi = roi // 2
-        half_win = win // 2
-
-        off_x, off_y = self._spotrec_center_offset
-        if self._spotrec_running and gray_frame is not None and isinstance(meta, dict):
-            try:
-                off_x = int(round(float(meta.get("off_x_start", off_x))))
-                off_y = int(round(float(meta.get("off_y_start", off_y))))
-            except Exception:
-                pass
-            off_x = max(-half_win + half_roi, min(half_win - half_roi, int(round(off_x))))
-            off_y = max(-half_win + half_roi, min(half_win - half_roi, int(round(off_y))))
-        else:
-            off_x = max(-half_win + half_roi, min(half_win - half_roi, int(round(off_x))))
-            off_y = max(-half_win + half_roi, min(half_win - half_roi, int(round(off_y))))
-            self._spotrec_center_offset = (off_x, off_y)
-
-        x0 = half_win + off_x - half_roi
-        y0 = half_win + off_y - half_roi
-        x1 = x0 + roi - 1
-        y1 = y0 + roi - 1
-
-        disp_size = int(self._spotrec_preview_size) * int(self._spotrec_preview_scale)
-        disp_size = max(10, disp_size)
-        scale = float(disp_size) / float(win) if win > 0 else 1.0
-        img = Image.fromarray(u8).convert("RGB")
-        img = img.resize((disp_size, disp_size), resample=Image.NEAREST)
-        # Draw ROI box on the scaled preview so the border doesn't expand with zoom.
-        sx0 = int(round(x0 * scale))
-        sy0 = int(round(y0 * scale))
-        sx1 = int(round((x1 + 1) * scale - 1))
-        sy1 = int(round((y1 + 1) * scale - 1))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle([sx0, sy0, sx1, sy1], outline=(255, 0, 0), width=1)
-        # Debug overlay: actual ROI + phase.
-        meta = getattr(self, "_spotrec_roi_meta", None)
-        if meta is not None:
-            try:
-                px = int(meta.get("phase_x", int(meta.get("x", 0)) % 2))
-                py = int(meta.get("phase_y", int(meta.get("y", 0)) % 2))
-                txt = f"ROI {int(meta.get('w', 0))}x{int(meta.get('h', 0))} @ ({int(meta.get('x', 0))},{int(meta.get('y', 0))})  phase {px},{py}"
-                draw2 = ImageDraw.Draw(img)
-                draw2.rectangle([0, img.height - 14, img.width, img.height], fill=(0, 0, 0))
-                draw2.text((2, img.height - 12), txt, fill=(255, 255, 255))
-            except Exception:
-                pass
-        photo = ImageTk.PhotoImage(img)
-        self._spotrec_preview_label.configure(image=photo)
-        self._spotrec_preview_label.image = photo
+        try:
+            source = np.asarray(source)
+            if source.ndim != 2:
+                return
+            if self._spotrec_running:
+                # Display the acquired camera ROI directly, without an artificial
+                # n-1 crop or a fixed 18-pixel canvas that misrepresents its size.
+                window = source
+                box = (0, 0, source.shape[1]-1, source.shape[0]-1)
+            else:
+                size = self._normalised_roi_size(self._spotrec_size_var.get())
+                win = max(31, size + 16)
+                cx, cy = center
+                x0, y0 = int(round(cx))-win//2, int(round(cy))-win//2
+                window = self._extract_window(source, cx, cy, win)
+                off_x, off_y = self._spotrec_center_offset
+                request = self._roi_from_target_center((cx+off_x, cy+off_y), size)
+                box = (request["x"]-x0, request["y"]-y0,
+                       request["x"]-x0+request["w"]-1, request["y"]-y0+request["h"]-1)
+                self._spotrec_preview_origin = (x0, y0)
+            u8 = detect_spinners.to_u8_preview(window, lo_pct=0, hi_pct=99.5)
+            display_size = 300
+            scale = display_size / max(window.shape)
+            image = Image.fromarray(u8).convert("RGB")
+            image = image.resize((max(1, round(window.shape[1]*scale)), max(1, round(window.shape[0]*scale))), Image.Resampling.NEAREST)
+            ImageDraw.Draw(image).rectangle(tuple(v*scale for v in box), outline="red", width=2)
+            self._spotrec_preview_display_scale = scale
+            photo = ImageTk.PhotoImage(image)
+            self._spotrec_preview_label.configure(image=photo)
+            self._spotrec_preview_label.image = photo
+        except (ValueError, OverflowError):
+            self._spotrec_status_var.set("ROI must be 2–1024 sensor px; odd sizes round down.")
 
     def _set_spot_playback_enabled(self, enabled: bool) -> None:
         if self._spot_play_btn is None:
@@ -6477,22 +6465,21 @@ class BasicVideoPlayer:
             self._spot_play_btn.configure(state=tk.DISABLED)
 
     def _on_spotrec_preview_click(self, event) -> None:
+        if self._spotrec_running or self._spotrec_proc is not None:
+            self._spotrec_status_var.set("Stop recording before moving its ROI; changes apply to the next recording.")
+            return
         if self._get_selected_spot_center(tracked=False) is None:
             return
-        win = int(self._spotrec_preview_size)
-        scale = int(self._spotrec_preview_scale)
-        if scale <= 0:
+        scale = getattr(self, "_spotrec_preview_display_scale", 0)
+        origin = getattr(self, "_spotrec_preview_origin", None)
+        if scale <= 0 or origin is None:
             return
-        try:
-            x = int(event.x // scale)
-            y = int(event.y // scale)
-        except Exception:
-            return
-        half_win = win // 2
-        off_x = x - half_win
-        off_y = y - half_win
-        self._spotrec_center_offset = (off_x, off_y)
-        self._spotrec_update_preview()
+        center = self._get_selected_spot_center(tracked=False)
+        self._spotrec_center_offset = (
+            int(round(origin[0] + event.x/scale - center[0])),
+            int(round(origin[1] + event.y/scale - center[1])),
+        )
+        self._spotrec_update_preview(gray_frame=self._live_last_frame if self._live_running else None)
 
     def _spotrec_on_frame(self, arr_obj: object) -> None:
         if not self._spotrec_running:
@@ -6520,7 +6507,7 @@ class BasicVideoPlayer:
 
     def _spotrec_compute_xy_phi(self, gray: np.ndarray) -> tuple[float, float, float]:
         meta = getattr(self, "_spotrec_roi_meta", None)
-        win_raw = self._parse_int(self._spotrec_size_var.get()) or 7
+        win_raw = (meta or {}).get("win_raw", self._normalised_roi_size(self._spotrec_size_var.get()))
         return self._xy_phi_from_frame(gray=np.asarray(gray), roi_meta=meta, win_raw=int(win_raw))
 
     def _spotrec_tick(self) -> None:
@@ -6537,6 +6524,11 @@ class BasicVideoPlayer:
 
     def _start_spotrec(self) -> None:
         if self._spotrec_running:
+            return
+        try:
+            requested_roi = self._normalised_roi_size(self._spotrec_size_var.get())
+        except (ValueError, OverflowError):
+            messagebox.showerror("Spot examine", "ROI must be 2–1024 sensor pixels; odd sizes round down.")
             return
         center = self._get_selected_spot_center(tracked=False)
         if center is None:
@@ -6562,10 +6554,8 @@ class BasicVideoPlayer:
         self._stop_live_feed()
         preview_every = int(max(1, int(self._spotrec_preview_every)))
         off_x, off_y = self._spotrec_center_offset
-        w_user = self._parse_int(self._spotrec_size_var.get()) or 7
-        w_user = max(1, int(w_user))
-        if w_user % 2 == 0:
-            w_user += 1
+        w_user = requested_roi
+        self._spotrec_size_var.set(str(w_user))
         cx2 = float(cx) + float(off_x)
         cy2 = float(cy) + float(off_y)
         roi_req = self._roi_from_target_center(center=(cx2, cy2), roi_raw=int(w_user))
@@ -6837,6 +6827,7 @@ class BasicVideoPlayer:
                     extra={
                         "xy_series_summary": self._stationary_series_full_metrics(xy_series),
                         "fetch_frames_output": data,
+                        "source_frame_stack": self.video_path,
                     },
                 )
                 _clear_preview()
@@ -6954,7 +6945,7 @@ class BasicVideoPlayer:
         Click a spot ring on the S-map overview to jump to that spot.
         Uses nearest-center selection with a radius gate.
         """
-        if self._smap_canvas is None or not self._spot_centers:
+        if self._smap_canvas is None:
             return
 
         # Convert to canvas coordinates (accounts for scrolling).
@@ -6966,6 +6957,10 @@ class BasicVideoPlayer:
         fx = x / scale
         fy = y / scale
 
+        if self._manual_add_armed:
+            self._manual_add_armed = False
+            self._edit_manual_spot((fx, fy), remove=False)
+            return
         centers = np.asarray(self._spot_centers, dtype=np.float32)
         if centers.ndim != 2 or centers.shape[1] != 2:
             return
@@ -6983,6 +6978,75 @@ class BasicVideoPlayer:
         self._spot_idx = i
         self._update_spot_view()
         self._rebuild_smap_overlay()
+
+    @staticmethod
+    def _normalised_roi_size(value) -> int:
+        size = int(float(value))
+        if not 2 <= size <= 1024:
+            raise ValueError("ROI must be between 2 and 1024 sensor pixels.")
+        return size - size % 2
+
+    def _apply_magnifier_roi(self) -> None:
+        if self._spotrec_running or self._live_capture_running or self._stationary_capture_running:
+            messagebox.showinfo("ROI", "Finish the current recording before changing ROI/settings.")
+            return
+        if self._intensity_diagnostic.active or self._intensity_tuner.active is not None:
+            messagebox.showinfo("ROI", "Finish the diagnostic/tuning trial before changing ROI/settings.")
+            return
+        try:
+            size = self._normalised_roi_size(self._live_capture_roi_var.get())
+        except (ValueError, OverflowError):
+            messagebox.showerror("ROI", "Enter an ROI size from 2 to 1024 sensor pixels; odd sizes round down.")
+            return
+        self._live_capture_roi_var.set(str(size))
+        restart = self._live_intensity_running
+        if restart:
+            self._stop_live_intensity_analysis()
+        self._live_clear_captured_xy_freeze()
+        if restart:
+            self._start_live_intensity_analysis()
+        else:
+            self._apply_live_settings()
+
+    def _use_live_spot(self) -> None:
+        if self._live_zoom_center is None:
+            messagebox.showinfo("Spot", "Click a rod in the live image first.")
+            return
+        self._set_selected_center_override(self._live_zoom_center, source="manual live")
+        self._spotrec_center_offset = (0, 0)
+        self._update_spotrec_label()
+        self._notebook.select(self._spotrec_tab)
+
+    def _arm_add_spot(self) -> None:
+        self._manual_add_armed = not self._manual_add_armed
+        self.bottom_var.set("Click the map to add a spot; press Add again to cancel." if self._manual_add_armed else "Add cancelled.")
+
+    def _remove_manual_spot(self) -> None:
+        if self._spot_centers:
+            self._edit_manual_spot(self._spot_centers[self._spot_idx], remove=True)
+
+    def _edit_manual_spot(self, point, remove: bool) -> None:
+        if self._acquisition_busy() or not self._analysis_finished:
+            messagebox.showinfo("Spots", "Wait until acquisition and loaded-file analysis finish before editing spots.")
+            return
+        if self._s_map is None or not self.video_path:
+            return
+        x, y = map(float, point)
+        h, w = self._s_map.shape
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        path = self.video_path
+        if not self._close_video():
+            return
+        edits = self._manual_spot_edits.setdefault(str(path), {"added": [], "removed": []})
+        key, opposite = ("removed", "added") if remove else ("added", "removed")
+        edits[opposite] = [p for p in edits[opposite] if np.hypot(x-p[0], y-p[1]) >= 3]
+        if not any(np.hypot(x-p[0], y-p[1]) < 3 for p in edits[key]):
+            edits[key].append((x, y))
+        # Reuse the background analysis pipeline so channel arrays, ROI bounds,
+        # plots and filtered lists are rebuilt together, never edited out of sync.
+        self._load_source(path)
+        self.bottom_var.set("Manual spot edit applied; rebuilding analysis. Edits last for this app session.")
 
     def _smap_preview_u8(self, s_map: np.ndarray) -> np.ndarray:
         """
@@ -7092,9 +7156,9 @@ class BasicVideoPlayer:
         x = int(round(cx))
         y = int(round(cy))
         x0 = x - half
-        x1 = x + half + 1
+        x1 = x0 + size
         y0 = y - half
-        y1 = y + half + 1
+        y1 = y0 + size
 
         window = np.zeros((size, size), dtype=img.dtype)
 
@@ -8059,6 +8123,9 @@ class BasicVideoPlayer:
             if abs(float(b)) >= bmin:
                 keep.append(i)
 
+        manual = self._manual_spot_edits.get(str(self.video_path), {}).get("added", [])
+        keep = sorted(set(keep) | {i for i, p in enumerate(centers)
+                                  if any(np.hypot(p[0]-q[0], p[1]-q[1]) < 3 for q in manual)})
         if not keep:
             msg = f"Dir filter kept 0/{len(centers)} (|B|>{bmin:.2f})."
             self._ui_call(self.bottom_var.set, msg)
@@ -9344,6 +9411,7 @@ class BasicVideoPlayer:
             "channel_values": "Mean saved DN; no additional background subtraction or display stretching",
             "sensor_origin": list(self._intensity_origin), "origin_source": self._intensity_origin_source,
             "averaging": method, "window_frames": window or frame_count, "partial_last_window": "included",
+            "manual_spot_edits": self._manual_spot_edits.get(str(self.video_path), {}),
             "theta_model_key": model, "theta_model": dict(self.THETA_RECON_MODELS[model]),
             "calibration_status": "Existing theoretical finite-NA model; not validated for this sample",
             "orientation_convention": "theta 0..90 deg; continuous doubled-azimuth branch before Cartesian averaging; final phi folded modulo 180 deg",

@@ -39,7 +39,7 @@ the original script with the current Python interpreter, preserving its local
 imports and camera subprocess layout. `--help` does not open the GUI or camera.
 
 `--data-dir` selects the working directory for recordings, backgrounds, and
-analysis output; it defaults to the current directory. Use a dedicated directory
+analysis output; it defaults to `./data`. Use a dedicated directory
 outside any known-working reference installation. This option is not a sandbox:
 file dialogs and explicitly selected output paths can still use other locations.
 

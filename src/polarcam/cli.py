@@ -34,8 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path.cwd(),
-        help="Directory for recordings and analysis output (default: current directory).",
+        default=Path.cwd() / "data",
+        help="Data root for experiment/session folders (default: ./data).",
     )
     arguments = parser.parse_args(argv)
     data_dir = arguments.data_dir.expanduser().resolve()
