@@ -10,6 +10,7 @@ import numpy as np
 from PySide6.QtWidgets import QApplication
 
 from Controlling.controller.controller import Controller
+from polarcam.live.background_profiles import read_background_profile
 
 
 log = logging.getLogger(__name__)
@@ -41,17 +42,11 @@ def _find_background_profile_path() -> Path | None:
     return None
 
 
-def _load_background_profile() -> tuple[np.ndarray | None, Path | None]:
-    path = _find_background_profile_path()
+def _load_background_profile(path: Path | None = None) -> tuple[np.ndarray, dict]:
+    path = path if path is not None else _find_background_profile_path()
     if path is None:
-        return None, None
-    try:
-        prof = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32)
-    except Exception:
-        return None, path
-    if prof.ndim != 2:
-        return None, path
-    return prof, path
+        raise RuntimeError("Background subtraction requested, but no profile is available. Select a background first.")
+    return read_background_profile(path)
 
 
 def _crop_background_profile(
@@ -95,11 +90,13 @@ def _subtract_background(
     requested_roi: tuple[int, int, int, int] | None,
 ) -> np.ndarray:
     arr = np.asarray(frame)
-    if profile is None or arr.ndim != 2:
+    if profile is None:
         return np.array(arr, copy=True)
+    if arr.ndim != 2:
+        raise ValueError("Background subtraction requires a 2D camera frame.")
     bg = _crop_background_profile(profile, (int(arr.shape[0]), int(arr.shape[1])), actual_roi, requested_roi)
     if bg is None:
-        return np.array(arr, copy=True)
+        raise ValueError("Selected background does not cover the camera ROI; select a matching full-frame profile.")
     work = arr.astype(np.float32, copy=False) - bg
     np.maximum(work, 0.0, out=work)
     if arr.dtype == np.uint8:
@@ -163,16 +160,25 @@ def fetch_frames(
     preview_every: int | None = None,
     subtract_background: bool = False,
     frame_timeout_s: float = 5.0,
+    background_profile_path: Path | None = None,
+    background_profile_sha256: str | None = None,
 ) -> tuple[Path, float | None, int, dict | None]:
     frame_timeout_s = float(frame_timeout_s)
     if not np.isfinite(frame_timeout_s) or frame_timeout_s <= 0.0:
         raise ValueError("Frame timeout must be finite and > 0 seconds.")
+    background_profile = None
+    background_metadata = {
+        "background_profile_path": None,
+        "background_profile_file": None,
+        "background_profile_sha256": None,
+        "background_profile_source_path": None,
+    }
+    if subtract_background:
+        background_profile, background_metadata = _load_background_profile(background_profile_path)
+        if background_profile_sha256 and background_metadata["background_profile_sha256"] != background_profile_sha256:
+            raise RuntimeError("Background changed before recording started; select the intended profile and retry.")
     app = QApplication.instance() or QApplication([])
     controller = Controller()
-    background_profile = None
-    background_profile_path = None
-    if subtract_background:
-        background_profile, background_profile_path = _load_background_profile()
 
     collected: list[np.ndarray] = []
     done = False
@@ -461,7 +467,7 @@ def fetch_frames(
         "max_raw_value": max_raw_value,
         "max_saved_value": (int(np.max(stack)) if stack.size else None),
         "phase_marker_appended": bool(marker is not None),
-        "background_profile_path": (str(background_profile_path) if background_profile_path is not None else None),
+        **background_metadata,
         "background_subtracted": bool(subtract_background and (background_profile is not None)),
     }
 
@@ -482,6 +488,8 @@ def main() -> None:
     parser.add_argument("--preview-path", default=None, help="Path to write a single-frame preview .npy")
     parser.add_argument("--preview-every", type=int, default=None, help="Write preview every N frames")
     parser.add_argument("--subtract-background", action="store_true", help="Subtract stored background profile")
+    parser.add_argument("--background-profile", type=Path, help="Exact active background NPY selected by the GUI")
+    parser.add_argument("--background-profile-sha256", help="Reject a profile changed since the GUI started this capture")
     parser.add_argument("--frame-timeout", type=float, default=5.0, help="Maximum seconds without a camera frame (default: 5)")
     parser.add_argument("--json", action="store_true", help="Emit JSON with path and actual_fps")
     args = parser.parse_args()
@@ -502,6 +510,8 @@ def main() -> None:
         preview_every=args.preview_every,
         subtract_background=bool(args.subtract_background),
         frame_timeout_s=args.frame_timeout,
+        background_profile_path=args.background_profile,
+        background_profile_sha256=args.background_profile_sha256,
     )
     if args.json:
         print(json.dumps({
@@ -515,6 +525,9 @@ def main() -> None:
             "max_saved_value": (actual_info or {}).get("max_saved_value"),
             "phase_marker_appended": (actual_info or {}).get("phase_marker_appended"),
             "background_profile_path": (actual_info or {}).get("background_profile_path"),
+            "background_profile_file": (actual_info or {}).get("background_profile_file"),
+            "background_profile_source_path": (actual_info or {}).get("background_profile_source_path"),
+            "background_profile_sha256": (actual_info or {}).get("background_profile_sha256"),
             "background_subtracted": (actual_info or {}).get("background_subtracted"),
         }))
     else:

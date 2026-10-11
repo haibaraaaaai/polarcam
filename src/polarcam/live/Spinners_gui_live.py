@@ -43,6 +43,7 @@ from pol_reconstruction import make_qu_reconstructor
 from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
 from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope, roi_channel_means
 from polarcam.live import intensity_spots
+from polarcam.live.background_profiles import read_background_profile, save_active_background
 
 
 def _dispatch_camera_events() -> None:
@@ -717,20 +718,26 @@ class BasicVideoPlayer:
         out.mkdir(parents=True, exist_ok=True)
         return out
 
-    def _set_active_background_profile(self, profile: np.ndarray, source_path: Optional[Path] = None) -> Path:
+    def _set_active_background_profile(
+        self, profile: np.ndarray, source_path: Optional[Path] = None, *, refresh_ui: bool = True,
+    ) -> Path:
         arr = np.asarray(profile, dtype=np.float32)
         if arr.ndim != 2:
             raise RuntimeError(f"Background profile must be 2D, got shape {tuple(arr.shape)}.")
         out_path = self._background_profile_storage_path()
-        np.save(out_path, arr)
         with self._analysis_lock:
+            metadata = save_active_background(arr, out_path, source_path)
             self._background_profile = arr
             self._background_profile_path = out_path
-        if self._live_intensity_running:
-            self._prepare_live_intensity_background()
-        self._refresh_background_profile_info()
-        if source_path is not None:
-            self.bottom_var.set(f"Active background profile: {source_path}")
+            self._background_profile_metadata = metadata
+            stat = out_path.stat()
+            self._background_profile_signature = (stat.st_mtime_ns, stat.st_size)
+        if refresh_ui:
+            if self._live_intensity_running:
+                self._prepare_live_intensity_background()
+            self._refresh_background_profile_info()
+            if source_path is not None:
+                self.bottom_var.set(f"Active background profile: {source_path}")
         return out_path
 
     def _refresh_background_profile_info(self) -> None:
@@ -740,9 +747,23 @@ class BasicVideoPlayer:
             return
         shape_txt = ""
         prof = self._load_background_profile()
-        if prof is not None and prof.ndim == 2:
-            shape_txt = f" {int(prof.shape[1])}x{int(prof.shape[0])}"
-        self._background_profile_info_var.set(f"Background profile: loaded{shape_txt} ({path.name})")
+        if prof is None:
+            self._background_profile_info_var.set("Background profile: could not load")
+            return
+        shape_txt = f" {int(prof.shape[1])}x{int(prof.shape[0])}"
+        source = getattr(self, "_background_profile_metadata", {}).get("background_profile_source_path")
+        name = Path(source).name if source else f"{path.name}; source unknown"
+        self._background_profile_info_var.set(f"Background profile:{shape_txt} ({name})")
+
+    def _background_capture_args(self) -> list[str]:
+        path = self._find_background_profile_path()
+        if path is None:
+            raise RuntimeError("Select a background profile before recording with subtraction.")
+        _, metadata = read_background_profile(path)
+        return [
+            "--subtract-background", "--background-profile", metadata["background_profile_path"],
+            "--background-profile-sha256", metadata["background_profile_sha256"],
+        ]
 
     def _background_average_frame_path(self, source_path: Path) -> Path:
         return source_path.with_name(f"{source_path.stem} average frame{source_path.suffix}")
@@ -916,8 +937,9 @@ class BasicVideoPlayer:
                     f"background_min_{ts}_exp{float(exp_ms):.4g}ms_gain{float(gain):.4g}.npy"
                 )
                 np.save(profile_path, min_frame.astype(np.float32, copy=False))
-                active_path = self._background_profile_storage_path()
-                np.save(active_path, min_frame.astype(np.float32, copy=False))
+                active_path = self._set_active_background_profile(min_frame, profile_path, refresh_ui=False)
+                with self._analysis_lock:
+                    active_metadata = dict(self._background_profile_metadata)
                 bg_sidecar_requested = {
                     "fps": None,
                     "exp_ms": float(exp_ms),
@@ -958,11 +980,8 @@ class BasicVideoPlayer:
                     roi=(data.get("roi") if isinstance(data.get("roi"), dict) else {}),
                     background=self._background_metadata(False, actual=False, profile_path=None),
                     sound=sound_meta,
-                    extra={"source_profile": str(profile_path)},
+                    extra={"source_profile": str(profile_path), **active_metadata},
                 )
-                with self._analysis_lock:
-                    self._background_profile = min_frame.astype(np.float32, copy=False)
-                    self._background_profile_path = active_path
                 self._ui_call(self._refresh_background_profile_info)
                 try:
                     stack_path.unlink()
@@ -992,10 +1011,16 @@ class BasicVideoPlayer:
         path = self._find_background_profile_path(base_dir=base_dir)
         if path is None:
             return None
+        try:
+            stat = path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
         with self._analysis_lock:
             cached = getattr(self, "_background_profile", None)
             cached_path = getattr(self, "_background_profile_path", None)
-        if cached is not None and cached_path is not None:
+            cached_signature = getattr(self, "_background_profile_signature", None)
+        if cached is not None and cached_path is not None and cached_signature == signature:
             try:
                 if Path(cached_path).resolve() == path.resolve():
                     return cached
@@ -1003,7 +1028,7 @@ class BasicVideoPlayer:
                 if str(cached_path) == str(path):
                     return cached
         try:
-            prof = np.asarray(np.load(path, allow_pickle=False), dtype=np.float32)
+            prof, metadata = read_background_profile(path)
         except Exception:
             return None
         if prof.ndim != 2:
@@ -1011,6 +1036,8 @@ class BasicVideoPlayer:
         with self._analysis_lock:
             self._background_profile = prof
             self._background_profile_path = path
+            self._background_profile_metadata = metadata
+            self._background_profile_signature = signature
         return prof
 
     def _crop_background_profile(
@@ -1235,7 +1262,7 @@ class BasicVideoPlayer:
             args.extend(["--gain-analog", str(float(gain_analog))])
         args.extend(["--gain-digital", "1.0"])
         if subtract_background:
-            args.append("--subtract-background")
+            args.extend(self._background_capture_args())
 
         proc = subprocess.run(
             args,
@@ -1263,6 +1290,7 @@ class BasicVideoPlayer:
             bool(subtract_background),
             actual=data.get("background_subtracted"),
             profile_path=data.get("background_profile_path"),
+            profile_info=data,
         )
         self._write_recording_sidecar(
             path,
@@ -3272,17 +3300,19 @@ class BasicVideoPlayer:
         requested: bool,
         actual: Optional[bool] = None,
         profile_path: Optional[Path | str] = None,
+        profile_info: Optional[dict] = None,
     ) -> dict:
-        should_have_profile = bool(requested) or (bool(actual) if actual is not None else False)
-        p = Path(profile_path) if profile_path else (
-            self._find_background_profile_path() if should_have_profile else None
-        )
-        actual_bool = bool(actual) if actual is not None else bool(requested and p is not None)
+        # Use the recorder's start-of-capture metadata, never the current active
+        # file: the operator may have selected another profile in the meantime.
+        p = Path(profile_path) if profile_path else None
+        info = profile_info or {}
         return {
             "background_subtract_requested": bool(requested),
-            "background_subtracted": bool(actual_bool),
+            "background_subtracted": bool(actual),
             "background_profile_path": (str(p) if p is not None else None),
             "background_profile_file": (p.name if p is not None else None),
+            "background_profile_source_path": info.get("background_profile_source_path"),
+            "background_profile_sha256": info.get("background_profile_sha256"),
         }
 
     def _recording_sidecar_path(self, npy_path: Path) -> Path:
@@ -3849,7 +3879,7 @@ class BasicVideoPlayer:
             if gain_digital is not None:
                 args.extend(["--gain-digital", str(float(gain_digital))])
             if bool(subtract_background):
-                args.append("--subtract-background")
+                args.extend(self._background_capture_args())
             proc = subprocess.run(args, capture_output=True, text=True, check=False)
             if proc.returncode != 0:
                 err = (proc.stderr or proc.stdout or "").strip()
@@ -3939,6 +3969,7 @@ class BasicVideoPlayer:
             bool(subtract_background),
             actual=fetch_data.get("background_subtracted"),
             profile_path=fetch_data.get("background_profile_path"),
+            profile_info=fetch_data,
         )
         sound_meta = dict(sound_meta or self._sound_metadata())
 
@@ -3975,6 +4006,8 @@ class BasicVideoPlayer:
                 ),
                 "background_subtracted": fetch_data.get("background_subtracted"),
                 "background_profile_path": fetch_data.get("background_profile_path"),
+                "background_profile_source_path": fetch_data.get("background_profile_source_path"),
+                "background_profile_sha256": fetch_data.get("background_profile_sha256"),
                 "phase_marker_appended": fetch_data.get("phase_marker_appended"),
                 "max_pixel_value": (
                     float(np.max(arr)) if getattr(arr, "size", 0) else None
@@ -6605,10 +6638,9 @@ class BasicVideoPlayer:
             "--n-frames",
             "1000000",
         ]
-        if subtract_background:
-            args.append("--subtract-background")
-
         try:
+            if subtract_background:
+                args.extend(self._background_capture_args())
             proc = subprocess.Popen(
                 args,
                 stdout=subprocess.PIPE,
@@ -6801,6 +6833,7 @@ class BasicVideoPlayer:
                     bool(requested_meta.get("background_subtract_requested", False)),
                     actual=data.get("background_subtracted"),
                     profile_path=data.get("background_profile_path"),
+                    profile_info=data,
                 )
                 self._write_recording_sidecar(
                     path,

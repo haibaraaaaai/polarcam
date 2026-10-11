@@ -1,5 +1,6 @@
 from collections import deque
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +17,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from polarcam import cli
 from polarcam.live import intensity_spots
+from polarcam.live.background_profiles import read_background_profile, save_active_background
 from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, compare_modulation, display_envelope, modulation_stats
 
 
@@ -1151,6 +1153,56 @@ class FrameTimingTests(unittest.TestCase):
         self.assertEqual(timed[0][1], 123.456)
 
 
+class BackgroundProfileProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.active = Path(self.directory.name) / "background_profile.npy"
+
+    def test_switching_profiles_keeps_name_but_changes_pixels_source_and_hash(self):
+        player = live_gui.BasicVideoPlayer.__new__(live_gui.BasicVideoPlayer)
+        player._analysis_lock = threading.Lock()
+        player._background_profile_storage_path = lambda: self.active
+        player._find_background_profile_path = lambda base_dir=None: self.active
+        for name, value in (("wide.npy", 32), ("narrow.npy", 5)):
+            source = self.active.with_name(name)
+            player._set_active_background_profile(np.full((8, 8), value), source, refresh_ui=False)
+            profile, metadata = read_background_profile(self.active)
+            np.testing.assert_array_equal(profile, np.full((8, 8), value))
+            np.testing.assert_array_equal(player._load_background_profile(), profile)
+            self.assertEqual(metadata["background_profile_source_path"], str(source))
+            self.assertEqual(metadata["background_profile_sha256"], hashlib.sha256(self.active.read_bytes()).hexdigest())
+            args = player._background_capture_args()
+            self.assertEqual(args[args.index("--background-profile") + 1], str(self.active))
+            self.assertEqual(args[args.index("--background-profile-sha256") + 1], metadata["background_profile_sha256"])
+            if name == "wide.npy":
+                first_hash = metadata["background_profile_sha256"]
+        self.assertNotEqual(metadata["background_profile_sha256"], first_hash)
+
+    def test_external_overwrite_does_not_reuse_stale_source(self):
+        save_active_background(np.ones((8, 8)), self.active, self.active.with_name("wide.npy"))
+        np.save(self.active, np.full((8, 8), 9, dtype=np.float32))
+        profile, metadata = read_background_profile(self.active)
+        self.assertTrue(np.all(profile == 9))
+        self.assertIsNone(metadata["background_profile_source_path"])
+
+    def test_legacy_profile_remains_usable_without_inventing_a_source(self):
+        np.save(self.active, np.ones((8, 8)))
+        self.active.with_suffix(".json").write_text(json.dumps({"source_profile": "unverified.npy"}))
+        _, metadata = read_background_profile(self.active)
+        self.assertIsNone(metadata["background_profile_source_path"])
+        self.assertEqual(len(metadata["background_profile_sha256"]), 64)
+
+    def test_saved_capture_metadata_is_not_replaced_by_current_gui_profile(self):
+        player = live_gui.BasicVideoPlayer.__new__(live_gui.BasicVideoPlayer)
+        player._find_background_profile_path = Mock(side_effect=AssertionError("Current profile consulted"))
+        info = {"background_profile_source_path": "wide.npy", "background_profile_sha256": "captured-hash"}
+        metadata = player._background_metadata(True, actual=True, profile_path=self.active, profile_info=info)
+        self.assertEqual(metadata["background_profile_source_path"], "wide.npy")
+        self.assertEqual(metadata["background_profile_sha256"], "captured-hash")
+        self.assertIsNone(player._background_metadata(True, actual=False)["background_profile_path"])
+
+
 class CaptureReliabilityTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -1246,6 +1298,50 @@ class CaptureReliabilityTests(unittest.TestCase):
         _, _, count, _ = self.capture(n_frames=7, stop_after=7, frame_timeout_s=0.25)
         self.assertEqual(count, 7)
         self.assertGreater(self.now, 0.25)
+        self.assert_cleaned_up()
+
+    def test_explicit_background_and_provenance_are_frozen_at_capture_start(self):
+        active = Path(self.directory.name) / "background_profile.npy"
+        source = active.with_name("wide.npy")
+        expected = save_active_background(np.full((8, 8), 32), active, source)
+        self.frames.extend(np.full((8, 8), value, dtype=np.uint16) for value in (999, 1000, 1001))
+        switched = False
+
+        def switch_after_start():
+            nonlocal switched
+            if self.started and not switched:
+                save_active_background(np.full((8, 8), 5), active, active.with_name("narrow.npy"))
+                switched = True
+
+        self.on_poll = switch_after_start
+        with patch.object(fetch_frames, "_find_background_profile_path", side_effect=AssertionError("Fallback used")):
+            path, _, _, metadata = self.capture(
+                subtract_background=True, background_profile_path=active,
+                background_profile_sha256=expected["background_profile_sha256"],
+            )
+        np.testing.assert_array_equal(np.load(path)[:2, 0, 0], [968, 969])
+        self.assertTrue(switched)
+        self.assertTrue(metadata["background_subtracted"])
+        self.assertEqual(metadata["background_profile_source_path"], str(source))
+        self.assertEqual(metadata["background_profile_sha256"], expected["background_profile_sha256"])
+        self.assert_cleaned_up()
+
+    def test_missing_or_changed_requested_background_fails_before_camera_open(self):
+        active = Path(self.directory.name) / "background_profile.npy"
+        with self.assertRaises(FileNotFoundError):
+            self.capture(subtract_background=True, background_profile_path=active)
+        save_active_background(np.ones((8, 8)), active)
+        with self.assertRaisesRegex(RuntimeError, "Background changed"):
+            self.capture(subtract_background=True, background_profile_path=active, background_profile_sha256="old")
+        self.controller.open.assert_not_called()
+
+    def test_background_roi_mismatch_fails_without_saving_uncorrected_frames(self):
+        active = Path(self.directory.name) / "background_profile.npy"
+        save_active_background(np.ones((2, 2)), active)
+        self.frames.extend(np.full((8, 8), 1000, dtype=np.uint16) for _ in range(3))
+        with self.assertRaisesRegex(RuntimeError, "does not cover the camera ROI"):
+            self.capture(subtract_background=True, background_profile_path=active)
+        self.assertEqual(list(Path(self.directory.name).glob("frame_stack*.npy")), [])
         self.assert_cleaned_up()
 
     def test_stop_flag_finishes_a_partial_recording(self):

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-10-11 Background profile provenance (awaiting lab validation)
+
+- Active background selection now preserves the source filename and NPY SHA-256;
+  the GUI shows the source, and frame/spot/stationary sidecars retain the recorder's
+  loaded profile identity even if the active file is replaced later.
+- Recorders receive the GUI's explicit profile path and expected hash. Missing,
+  changed or incompatible profiles stop capture instead of claiming subtraction.
+- Historical sidecars are unchanged; their repeated active-file path cannot
+  identify earlier wide/narrow selections. Regression checks were added but not
+  run; source inspection only, with camera validation deferred to the lab.
+
 ## 2026-10-11 Workspace cleanup and operating manual
 
 - Removed one-off `_tmp/` editing scripts and the redundant `requirements.txt`.
