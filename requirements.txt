@@ -1,3 +1,0 @@
-# Install from the repository root. Runtime dependencies live in pyproject.toml.
-# For IDS camera bindings after installing the SDK: pip install -e ".[camera]"
--e .

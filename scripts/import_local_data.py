@@ -1,6 +1,6 @@
 """Copy local data with SHA-256 verification; preserve source names and sidecars.
 
-Usage: python tools/import_local_data.py SOURCE DESTINATION_WITHIN_DATA
+Usage: python scripts/import_local_data.py SOURCE DESTINATION_WITHIN_DATA
 The originals are kept. A local provenance manifest is written under data/local.
 """
 from pathlib import Path

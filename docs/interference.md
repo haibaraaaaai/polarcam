@@ -1,5 +1,11 @@
 # Interference tuning: physics, metrics, and workflow
 
+This is the technical reference for the interference metric. For the physical
+stage setup and daily operating sequence, use the root
+[Polarcam User Manual](../Polarcam%20User%20Manual.docx). The metric's synthetic
+checks do not validate suppression on the lab stage. The 10 October camera
+control changes are still awaiting software and lab validation.
+
 This document explains the interference-cancellation step of the APD/Polarcam
 nanorod system, why the original span-only tuning number misleads, and how to
 use the upgraded Interference tuning panel and the offline analyser.

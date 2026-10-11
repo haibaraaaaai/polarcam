@@ -2,7 +2,70 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## 2026-10-11 Workspace cleanup and operating manual
+
+- Removed one-off `_tmp/` editing scripts and the redundant `requirements.txt`.
+- Renamed `tools/` to `scripts/` and moved the desktop shortcut installer there;
+  adjusted its repository-relative paths. The launcher remains at the root.
+- Kept the existing software tests in `tests/`; no tests or camera execution were
+  performed. README now lists the separate command for standalone metric checks
+  and notes the older test expectations affected by the 10 October changes.
+- Consolidated root documentation into README plus `Polarcam User Manual.docx`.
+  The manual develops a copy of Hugh Bowman's 9 September handover into the
+  operating guide; the Desktop original is unchanged. It distinguishes the
+  physical controls, software declarations and pending lab validation.
+- Archived LAB_SETUP and REWRITE_NOTES as dated evidence; moved interference
+  methods here under `interference.md`. The separate 10 October camera update
+  has been incorporated into the operating manual and this change record.
+- Application source, tests, analysis projects and measurement files were not
+  changed by this cleanup. The Word document was rendered with Microsoft Word
+  and visually reviewed; that is document QA, not camera validation.
+
+## 2026-10-10 Camera controls awaiting validation
+
+Commit `10cc419` was reviewed as source only, with no tests, GUI launch or camera
+execution, at the user's request. Its intended changes are:
+
+- Shared requested exposure 0.6 ms and analogue gain 20 across live, magnifier,
+  full-frame, spot and stationary controls. Camera readbacks still determine what
+  was applied; supported gain limits may clamp the request.
+- Common hinges/bfm session selection, with frames/spots/stationary directories
+  beneath `data/<experiment>/polarcam/<session>/`. Background profiles remain
+  beneath the data root's `backgrounds/`. Historical imports are not renamed.
+- One manual On/Off/Unknown drive declaration, shared role and notes, with a
+  snapshot taken at acquisition start for frame and spot sidecars. The legacy
+  sound field derives from that declaration; Unknown is null. It does not switch
+  hardware or verify cancellation.
+- Human stationary review explicitly distinguishes pending/accepted/rejected;
+  files are retained, with a separate `review.json`. Acquisition metadata keeps
+  its original unreviewed status.
+- Explicit magnifier ROI/settings application and restart, live-target transfer
+  to Spot examine, requested/acquired ROI previews and fixed ROI during capture.
+  Sizes use even sensor pixels, with odd sizes rounded down. An even-crop
+  off-by-one error was corrected in the source.
+- Manual spot addition/removal reruns the loaded-file analysis. Added spots bypass
+  automatic motion/ring/directionality filters; edits persist for the current app
+  session and are included in analysis metadata, without modifying raw input.
+- Magnifier time plots can show native mean intensity, X or Y with ROI-origin
+  parity and the displayed subtraction setting; they are diagnostic anisotropies.
+
+The operating manual retains all eight pending lab checks: settings/readbacks,
+destinations/metadata, drive states, magnifier controls, spot ROI, manual edits,
+human review and camera lifecycle. Large GUI restructuring, automatic biological
+classification and hardware drive-amplitude control were outside this change.
+
+## 2026-10-10 Research workspace organisation
+
+Commit `1af2f29` introduced experiment/detector data folders, verified local
+imports, dated analysis directories, source-only analysis versioning and ignore
+rules for raw/generated/private files. Desktop source data were retained. The
+local import manifests record SHA-256 verification; measurements were not pushed.
+
+## Earlier unreleased changes before 10 October
+
+The entries below are preserved historical change descriptions. Defaults and
+validation claims belong to those earlier versions, not the current untested
+camera update. Refer to README and the user manual for current status.
 ### Added
 - Per-spot Theta(t) beside Phi(t), using the All-rod distribution reconstruction
   and selected finite-NA model, with invalid-sample gaps and model-change refresh.

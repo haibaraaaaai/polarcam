@@ -1,5 +1,12 @@
 # Rewrite Notes
 
+> Historical record archived on 11 October 2026. Current operating instructions
+> are in [Polarcam User Manual](../../Polarcam%20User%20Manual.docx), and current
+> software status is in [README](../../README.md). Unresolved findings remain
+> evidence for future review; they have not been revalidated by this cleanup.
+> Dates, paths, past validation results and embedded handoff prompts below are
+> historical context, not current instructions. Some old local links no longer resolve.
+
 ## Goal: Performance First
 
 Optimize reliable camera ROI/FPS transitions and buffer save/drain throughput.

@@ -1,5 +1,11 @@
 # Lab Setup And Acceptance
 
+> Historical record archived on 11 October 2026. Current operating instructions
+> are in [Polarcam User Manual](../../Polarcam%20User%20Manual.docx), and current
+> software setup is in [README](../../README.md). Dates, defaults, validation
+> results and paths below describe earlier work; some old local links no longer
+> resolve. This archive is retained as evidence, not maintained as a live guide.
+
 ## Stage 1: Open The Application
 
 Use the `testing/v3-rewrite` checkout. Double-click **Polarcam Lab** on the desktop

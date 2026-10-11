@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 if not exist "%~dp0.venv\Scripts\python.exe" (
     echo Polarcam's project-local Python environment is missing.
-    echo See LAB_SETUP.md in this folder for installation steps.
+    echo See README.md or Polarcam User Manual.docx in this folder for installation steps.
     pause
     exit /b 1
 )

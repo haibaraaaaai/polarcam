@@ -1,158 +1,163 @@
 # Polarcam
 
-Live polarization-camera acquisition and spot analysis. The maintained application
-is Hugh Bowman's Polarcam Live implementation, imported from Polarcam_v3 as a
-baseline for further development. Its acquisition and analysis methods have not
-been rewritten in this import.
+Polarization-camera acquisition, spot inspection and offline nanorod analysis.
+This README describes the software, repository and analysis entry points.
+The root [Polarcam User Manual](Polarcam%20User%20Manual.docx) covers everyday
+operation: opening the program, illumination, stage controls, interference tuning,
+backgrounds, recording modes and saving measurements. It is an editable working
+manual based on Hugh Bowman's 9 September 2026 handover.
 
-## Rewrite Goal
+**Current status:** the camera changes in `10cc419` were committed on 10 October
+without tests or camera execution, as requested. The manual marks their intended
+behaviour and carries the pending lab checklist. Documentation cleanup does not
+validate those changes. Older validation results in the archive apply to the
+versions and dates recorded there.
 
-Performance comes before structural tidiness: minimize reliable camera ROI/FPS
-transition time and buffer save/drain time. The planned spot cycler will visit a
-selected list of spots, record approximately 10 seconds at high FPS at each ROI,
-then repeat the list. Switching and saving must not consume a large fraction of
-the acquisition time. Data integrity remains essential; the cycler is not yet
-implemented and hardware transition latency has not been measured here.
+## Install and launch
 
-See [REWRITE_NOTES.md](REWRITE_NOTES.md) for decisions, implemented fixes, deferred
-scientific questions, and the home/lab validation plan.
-
-## Install and Run
-
-For desktop launch, machine setup, and the staged lab acceptance checklist, see
-[LAB_SETUP.md](LAB_SETUP.md). [Launch-Polarcam.cmd](Launch-Polarcam.cmd) opens the
-application with this checkout's `.venv`; run
-[Install-DesktopShortcut.ps1](Install-DesktopShortcut.ps1) to create **Polarcam Lab**
-on the Windows desktop. Its default data directory is this repository's `data/`.
-
-Use Python 3.12.10 or later with Tk support. From the repository root on Windows:
+Use Python >=3.12.10 with Tk support. In PowerShell at the repository root:
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
-python -m polarcam --data-dir .\data
+.\.venv\Scripts\python.exe -m pip install -e .
+.\Launch-Polarcam.cmd
 ```
 
-`polarcam` and `polarcam-gui` launch the same live application. The launcher starts
-the original script with the current Python interpreter, preserving its local
-imports and camera subprocess layout. `--help` does not open the GUI or camera.
-
-`--data-dir` selects the working directory for recordings, backgrounds, and
-analysis output; it defaults to `./data`. Use a dedicated directory
-outside any known-working reference installation. This option is not a sandbox:
-file dialogs and explicitly selected output paths can still use other locations.
-
-Live capture additionally requires the IDS peak SDK and camera drivers. Install
-IDS peak Cockpit first, then install the Python camera bindings in this environment:
+For live acquisition, first install the IDS peak SDK, camera drivers and Cockpit
+on the lab PC. Confirm camera access in Cockpit, close it, then install the bindings:
 
 ```powershell
-python -m pip install -e ".[camera]"
+.\.venv\Scripts\python.exe -m pip install -e ".[camera]"
 ```
 
-The camera SDK is not needed to analyze saved AVI/NPY files. Runtime dependencies
-are declared in [pyproject.toml](pyproject.toml); [requirements.txt](requirements.txt)
-installs that same project. The original machine's package pins were not imported
-as a lockfile, and its Python environment has not been reproduced.
+The SDK is not required for offline saved-file analysis. Dependencies are declared
+in [pyproject.toml](pyproject.toml); there is no separate requirements list to maintain.
+The old lab environment has not been reproduced as a pinned lockfile.
 
-## Application
-
-- Live camera preview, exposure/gain controls, and spot inspection.
-- AVI/NPY loading, spot detection, anisotropy reconstruction, and rotation analysis.
-- Spot recording through the bundled camera helper.
-- Standalone angle-distribution, TDMS, manual-rotation, and recording-comparison tools.
-
-The original standalone scripts remain under [src/polarcam/live](src/polarcam/live).
-For example, from the repository root:
+[Launch-Polarcam.cmd](Launch-Polarcam.cmd) uses this checkout's `.venv` and defaults
+to its `data/` folder. It retains a diagnostic console. To choose a data disk or
+create the **Polarcam Lab** desktop shortcut:
 
 ```powershell
-python src/polarcam/live/angle_distribution_analysis.py
-python src/polarcam/live/tdms_manual_scaling_xy_gui.py
+.\Launch-Polarcam.cmd --data-dir "D:\Polarcam Data"
+.\scripts\Install-DesktopShortcut.ps1 -DataDir "D:\Polarcam Data"
 ```
 
-The TDMS utility retains an upstream machine-specific default input path; select
-your own file. Most auxiliary behavior remains the imported baseline. Subsequent
-targeted changes are recorded in [CHANGELOG.md](CHANGELOG.md).
+The shortcut installer refuses to overwrite an existing shortcut. Relative
+`-DataDir` values are resolved against the repository root. Moving the checkout
+requires recreating the shortcut. `python -m polarcam`, `polarcam` and
+`polarcam-gui` use the same application; `--help` does not open the GUI or camera.
+With direct module/command invocation, the default data folder is `./data`
+relative to the current working directory. File dialogs can select other locations.
 
-The live and angle-analysis NPY readers use recorded FPS from accompanying JSON
-metadata and exclude v3 phase-marker images from the measurement frames. For old
-recordings without recorded FPS, the live reader asks for it; the angle tool
-requires an explicit FPS selection instead of guessing from the image size.
+## Repository layout
 
-The capture helper fails on reported camera errors or a stalled frame stream.
-Its `--frame-timeout` option defaults to 5 seconds without a frame, not a delay
-between captures or a limit on recording duration. Increase it for intentionally
-slow acquisition. This does not bound a blocked native SDK call or disk write.
+| Item | Purpose | Git policy |
+| --- | --- | --- |
+| `src/` | Camera application and reusable processing code | Track |
+| `analysis/` | Dated research analyses, figures and notebooks | Track selected source and clean notebook inputs; ignore generated/private material |
+| `data/` | Recordings, backgrounds and local imports | Ignore recordings; track the catalogue and folder documentation |
+| `scripts/` | Maintenance utilities: shortcut installation and verified data import | Track |
+| `tests/` | Automated software correctness checks using synthetic data/fake cameras | Track |
+| `docs/` | Technical methods, changelog and historical records | Track |
+| `Polarcam User Manual.docx` | Editable operating manual | Track |
+| `.venv/` | This machine's installed Python environment | Ignore |
 
-## Source Import and Attribution
+Data layout is described in [data/README.md](data/README.md), and analysis
+versioning in [analysis/README.md](analysis/README.md). A new camera session is
+intended to save under `data/<experiment>/polarcam/<session>/`; active background
+profiles remain under `data/backgrounds/`. Existing import paths are unchanged.
 
-Imported on 2026-09-15 from the local Polarcam_v3 checkout:
-
-- Source revision: `5fe41d5bdd9f089a441f30554888c0b4773e62a7` (2026-09-10).
-- Source directory: `polarcam_live/`.
-- Destination: `src/polarcam/live/`, preserving relative paths.
-- Scope: the 12 top-level Python scripts, three `backend/` Python files, and two
-  `Controlling/controller/` Python files, 17 upstream files in total.
-- All 17 files were imported byte-for-byte. Only package markers, the external
-  launcher, dependency metadata, and documentation were added or adapted at the
-  initial import, preserved in commit `bb47c6490379f4c8ae90cbfe6d3e4315dad2792c`.
-- The working source now includes targeted reliability fixes and a shared
-  recording-metadata helper; it is no longer byte-for-byte identical to v3.
-
-Hugh Bowman developed the v3 live application and analysis workflow, building on
-Daping Xu's earlier Polarcam camera software and rewrite. Upstream history also
-contains contributions recorded under the author name Hugh T. This is a source
-snapshot import, not a merge of the v3 commit history. Its source revision identifies
-the baseline in the retained local v3 repository.
-
-The existing [LICENSE](LICENSE) is retained unchanged. The imported v3 checkout
-contained no top-level project license. Attribution here does not resolve the
-license for those contributions; confirm permission and applicable notices before
-redistributing the combined application. This import does not assign a new license
-to Hugh's contributions.
-
-### Excluded From This Import
-
-- Calibration/theta-model assets, background profiles, recordings, and datasets.
-- Simulation/offline experiments and the dataset-specific analysis-script collection.
-- Virtual environments, Git metadata, build/distribution output, and generated plots.
-- V3's obsolete `src/polarcam` and `Polarcam_v3_Hugh` application copies.
-
-Missing calibration assets mean this is not an equivalent deployment of the lab
-installation: external theta models and background corrections require their
-corresponding files. No files were changed in the local v3 or Polarcam Software
-reference installations.
-
-## Earlier Versions
-
-The superseded Qt application, 2024 legacy implementation, offline utilities and
-notebooks, reference files, and old rewrite roadmap are preserved in Git history
-at `6c36303084b4ff799a277166df016b8b62e9c53d`.
-
-These earlier materials have been removed from the current source tree so the
-rewrite starts with only the maintained v3 live baseline. Existing Git history
-has not been rewritten.
-
-## Development Checks
-
-After installing the project, run the camera-free tests:
+To copy a later dataset while retaining the source and verifying SHA-256 hashes:
 
 ```powershell
-python -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe scripts/import_local_data.py "E:\New hinge data" "data\hinges\polarcam\import_YYYY-MM-DD"
 ```
 
-The import was checked for matching source hashes and Python syntax. Launcher
-tests cover the selected interpreter, script layout, working directory, help, and
-exit status. Regression tests use synthetic recordings and fake cameras to cover
-FPS/marker handling, capture errors and inactivity, and analysis-worker shutdown.
-These checks do not establish camera timing, hardware behavior, or scientific
-parity with the lab installation; those require separate validation.
+Run this from the repository root. The destination must be inside this checkout's
+`data/` folder. Differing existing files cause an error, and a local provenance
+manifest is written under `data/local/`. This utility is not part of camera launch.
 
-## Research workspace
+## Analysis entry points
 
-Local recordings and imports are organised under [data/](data/README.md), split
-by hinge/BFM experiment and camera/APD detector. Dated analysis projects are under
-[analysis/](analysis/README.md). Only code, clean notebook inputs and documentation
-are versioned; raw data, outputs and private correspondence are ignored.
-The former root intensity diagnostic is preserved under
-`data/hinges/polarcam/legacy_workspace_runs/`.
+Install notebook support in this environment when needed:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[analysis]"
+.\.venv\Scripts\python.exe -m jupyterlab analysis
+```
+
+The maintained paper trials are in `analysis/paper_analysis_20261008/`:
+
+- [APD hinge trial](analysis/paper_analysis_20261008/APD_hinge_publication_trial.ipynb)
+  uses the legacy Hugh APD recordings.
+- [Camera population trial](analysis/paper_analysis_20261008/Framestack_population_publication_trial.ipynb)
+  uses camera frame stacks.
+- `paper_figures.py` and `camera_trial.py` contain the associated processing.
+
+Earlier dated projects retain their own entry scripts. Local generated reports,
+figures, executed notebook backups and private correspondence are not portable
+through Git. Configure local input paths and check the model/correction choices
+before rerunning an analysis. This cleanup does not revise the analysis projects.
+
+Standalone application utilities remain under `src/polarcam/live/`, for example:
+
+```powershell
+.\.venv\Scripts\python.exe src/polarcam/live/angle_distribution_analysis.py
+.\.venv\Scripts\python.exe src/polarcam/live/tdms_manual_scaling_xy_gui.py
+.\.venv\Scripts\python.exe -m polarcam.live.interference_npz_analysis RECORDING.npz
+```
+
+The TDMS utility retains an upstream machine-specific default; select your own
+file. See [interference methods](docs/interference.md) for the diagnostic analysis.
+The live application's distribution histogram and paper notebook plots use
+different density conventions; consult the manual and each analysis's methods.
+
+## Development and validation
+
+`tests/` checks program behaviour; it is separate from experimental analysis.
+When testing is resumed, both commands are needed for the current suite:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe tests/test_interference_metrics.py
+```
+
+The second file contains standalone functions that `unittest` discovery does not
+run. No tests were executed for the 10 October camera changes or this cleanup.
+Some older tests still expect the old launch directory and 1.2 ms / gain 1
+defaults; review those expectations with the intended behaviour before running
+the suite. Synthetic checks do not establish actual FPS, lost-frame behaviour,
+stage response or experimental accuracy.
+
+The next hardware pass is listed in the user manual. Existing deferred findings
+about calibration/model selection, legacy azimuth unwrapping, sphere-axis fitting,
+native versus preview intensity scaling and saturation handling are preserved in
+[historical rewrite notes](docs/archive/REWRITE_NOTES.md#other-deferred-findings).
+Their present status has not been re-audited here. The planned repeating spot
+cycler is not implemented; reliable camera transitions and recording integrity
+remain the development priority.
+
+## Provenance and history
+
+Hugh Bowman's `polarcam_live/` implementation was imported from local Polarcam_v3
+revision `5fe41d5bdd9f089a441f30554888c0b4773e62a7` (10 September 2026), on
+15 September. The 17 upstream Python files were initially copied byte-for-byte
+into `src/polarcam/live/` in commit `bb47c6490379f4c8ae90cbfe6d3e4315dad2792c`;
+subsequent targeted changes mean the current tree is no longer identical.
+Hugh developed the v3 application on Daping Xu's earlier camera software; the
+upstream history also records contributions under Hugh T. This is a snapshot
+import, not a merge of upstream history.
+
+The existing [LICENSE](LICENSE) is unchanged. The imported checkout had no
+top-level project licence; this import does not assign a new licence to Hugh's
+contributions. Permission and applicable notices for redistribution remain to be
+resolved. Calibration assets, backgrounds, recordings and the original Python
+environment were not included in that source import. A Git checkout alone is
+therefore not an equivalent deployment of the lab installation.
+
+Earlier application versions are retained in Git at
+`6c36303084b4ff799a277166df016b8b62e9c53d`. See the
+[changelog](docs/changelog.md) for dated changes and
+[archived lab notes](docs/archive/LAB_SETUP.md) for historical observations.
+The Word manual is the maintained operating guide; archived logs are not current instructions.
