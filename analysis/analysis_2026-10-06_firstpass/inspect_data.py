@@ -1,6 +1,7 @@
 import json, pathlib, numpy as np, cv2
-out=pathlib.(Path(__file__).resolve().parents[2] / 'analysis/analysis_2026-10-06_firstpass')
-roots=[pathlib.(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh'),pathlib.(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/runs')]
+out=pathlib.Path(__file__).resolve().parent
+camera_root=pathlib.Path(__file__).resolve().parents[2] / 'data/hinges/polarcam'
+roots=sorted(camera_root.glob('2026-??-??'))
 rows=[]
 for root in roots:
  for p in root.rglob('*'):
@@ -22,7 +23,7 @@ for d in rows:
  if 'metadata' in d:
   m=d['metadata']; print(pathlib.Path(d['path']).name, d['shape'], m.get('actual',{}).get('fps'),m.get('background',{}).get('background_subtracted'),m.get('conditions'), m.get('sound'))
  if d['path'].endswith('.avi') or 'error' in d:print(d)
-for p in roots[1].glob('intensity*.npz'):
+for p in camera_root.glob('2026-10-*/intensity*.npz'):
  with np.load(p,allow_pickle=False) as z:
   print(p.name,[(k,z[k].shape,str(z[k].dtype)) for k in z.files]);
   for k in z.files:

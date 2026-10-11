@@ -8,8 +8,9 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 BASE=Path(__file__).resolve().parent
-OLD=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh')
-RUNS=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/runs')
+OLD=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/2026-09-18')
+RUNS=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam')
+OCTOBER=sorted(RUNS.glob('2026-10-*'))
 for sub in ['traces','plots']: (BASE/sub).mkdir(exist_ok=True)
 CONFIG={'roots':[str(OLD),str(RUNS)],'channel_order':['I0','I90','I45','I135'],'apertures_raw_px':[12,20],'detection':'2x2 cell mean, DoG sigma 0.8/3 cells; local maxima 7 cells; robust threshold median+8*MAD; reject another candidate within 12 raw px; strongest isolated up to 12','background':'four low-DoG patches, spatially separated; no further subtraction','frequency_search_hz':[1.2,1.9],'spectrum':'full-record Hann periodogram, linear detrend, density units DN^2/Hz; no line removal','amplitude':'least squares constant+linear trend+sin+cos; semi-amplitude / unmodified trace mean','timing':'sidecar actual fps; AVI header fps conditional; diagnostic fits use host receipt timestamps','raw_data_policy':'no original writes; sibling sidecars resolved locally, stale absolute paths ignored'}
 (BASE/'config.json').write_text(json.dumps(CONFIG,indent=2))
@@ -75,7 +76,7 @@ def save_trace(fid,path,t,ch,rois,info,mean=None,centroid=None,quality=None,extr
  print('extracted',fid,len(t),'frames',len(rois),'ROIs',flush=True)
 
 def avi():
- p=RUNS/'datasets/temp/recording_2026-10-02_2.avi';fid=p.stem
+ p=RUNS/'2026-10-02/recording_2026-10-02_2.avi';fid=p.stem
  if (BASE/'traces'/f'{fid}.npz').exists():return
  cap=cv2.VideoCapture(str(p));n=int(cap.get(cv2.CAP_PROP_FRAME_COUNT));fps=cap.get(cv2.CAP_PROP_FPS);frames=[]
  for i in np.linspace(0,n-1,80).astype(int):
@@ -173,8 +174,8 @@ if __name__=='__main__':
  mode=sys.argv[1] if len(sys.argv)>1 else 'all'
  if mode in ['all','avi']:avi()
  if mode in ['all','arrays']:
-  paths=[OLD/'frame_stack_20260918-145406.npy',RUNS/'datasets/temp/frame_stack_20261002-164530.npy']+sorted(OLD.glob('spotrec*.npy'))+sorted(RUNS.rglob('capture_maxfps_15x15.npy'))+sorted(OLD.glob('frame_stack*.npy'))+sorted(RUNS.rglob('frame_stack*.npy'))
+  paths=[OLD/'frame_stack_20260918-145406.npy',RUNS/'2026-10-02/frame_stack_20261002-164530.npy']+sorted(OLD.glob('spotrec*.npy'))+sorted(p for root in OCTOBER for p in root.rglob('capture_maxfps_15x15.npy'))+sorted(OLD.glob('frame_stack*.npy'))+sorted(p for root in OCTOBER for p in root.glob('frame_stack*.npy'))
   for p in dict.fromkeys(paths):arrayfile(p)
  if mode in ['all','diagnostics']:
-  for p in sorted(RUNS.glob('intensity_diagnostic*.npz')):diagnostic(p)
+  for p in sorted(RUNS.glob('2026-10-*/intensity_diagnostic*.npz')):diagnostic(p)
  if mode in ['all','analyse']:analyse()

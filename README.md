@@ -66,17 +66,17 @@ relative to the current working directory. File dialogs can select other locatio
 Data layout is described in [data/README.md](data/README.md), and analysis
 versioning in [analysis/README.md](analysis/README.md). A new camera session is
 intended to save under `data/<experiment>/polarcam/<session>/`; active background
-profiles remain under `data/backgrounds/`. Existing import paths are unchanged.
+profiles remain under `data/backgrounds/`.
 
 To copy a later dataset while retaining the source and verifying SHA-256 hashes:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/import_local_data.py "E:\New hinge data" "data\hinges\polarcam\import_YYYY-MM-DD"
+.\.venv\Scripts\python.exe scripts/import_local_data.py "E:\New hinge data" "data\hinges\polarcam\YYYY-MM-DD"
 ```
 
 Run this from the repository root. The destination must be inside this checkout's
-`data/` folder. Differing existing files cause an error, and a local provenance
-manifest is written under `data/local/`. This utility is not part of camera launch.
+`data/` folder. Differing existing files cause an error; provenance is added to
+local `data/index.csv`. This utility is not part of camera launch.
 
 ## Analysis entry points
 

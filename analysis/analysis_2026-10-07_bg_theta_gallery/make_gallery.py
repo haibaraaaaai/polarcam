@@ -8,7 +8,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 OUT=Path(__file__).resolve().parent
-ROOT=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/runs/datasets/temp')
+ROOT=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/2026-10-02')
 TIMES=['181519','181706','181829','182853','183613']
 A,B,C=.097840,.011915,.101852
 LIMIT=C/(A+B)

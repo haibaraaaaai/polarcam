@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from paper_figures import ROOT,OUT,angles,vectors,stereo,wrap_phi,density_grid,save,MODELS
 
-CAMERA_DATA=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh')
+CAMERA_DATA=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/2026-09-18')
 FRAMES=150
 LOCAL_BACKGROUND=False  # files already background-subtracted; do not subtract a second arbitrary offset
 DC_MIN=100.

@@ -1,11 +1,11 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "datasets": {
-    "hinge_camera_export": "hinges/polarcam/import_2026-10-09",
-    "hinge_camera_september": "hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh",
-    "hinge_camera_runs": "hinges/polarcam/import_2026-10-09/runs",
+    "hinge_camera": "hinges/polarcam",
+    "hinge_apd_root": "hinges/apd_polarcam",
     "hinge_apd": "hinges/apd_polarcam/legacy_hugh/Hinge apd recordings, 2 strand + notches",
-    "legacy_workspace_runs": "hinges/polarcam/legacy_workspace_runs"
+    "bfm_camera": "bfm/polarcam",
+    "bfm_apd": "bfm/apd_polarcam"
   },
-  "note": "Paths relative to data/. Imported file metadata is unmodified; sample/control identity must be confirmed from acquisition records."
+  "note": "Paths relative to data/. Camera recordings are grouped by acquisition date. Local index.csv contains file labels and provenance; raw sidecars are unchanged."
 }

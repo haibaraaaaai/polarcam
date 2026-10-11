@@ -10,7 +10,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 B=Path(__file__).resolve().parent
-ROOT=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/import_2026-10-09/remember to correct save pathing from hugh')
+ROOT=(Path(__file__).resolve().parents[2] / 'data/hinges/polarcam/2026-09-18')
 for d in ['traces','plots']:(B/d).mkdir(exist_ok=True)
 SEED=20261007
 CONFIG=dict(root=str(ROOT),seed=SEED,random_spots_per_stack=6,selection='uniform without replacement among intensity-detected isolated candidates; never selected by temporal spectrum',detection='2x2 cell mean; DoG sigma 0.8 and 3 cells; local maximum 7x7 cells; threshold median+8*1.4826*MAD; minimum 24 native-pixel candidate spacing; 20-pixel edge margin',bands_hz=[[.4,.85],[1.3,1.8]],spectrum='full-length Hann periodogram, linear detrend, density; no line filtering',amplitude='sinusoid semi-amplitude / saved mean, with offset and linear trend fit; not peak-to-peak',sample='September hinge collection as supplied; no October data',timing='sidecar actual fps; no per-frame sensor timestamps')
