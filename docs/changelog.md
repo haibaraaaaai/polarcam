@@ -14,9 +14,11 @@ All notable changes to this project will be documented in this file.
   fixed Mono12 scaling, 25-unit bins, near-limit and sensor-clipping counts.
   Subtracted captures preserve raw peak projections so subtraction cannot hide
   clipping. Legacy data explicitly report unavailable raw clipping evidence.
+- Live preview waits for actual frames before reporting a running feed and
+  displays camera startup/stream errors instead of silently showing a black image.
 - Fixed dim-frame display scaling, reduced background-projection memory use,
   separated crowded control rows and clarified Save copy / Close recording.
-- Camera-free GUI and synthetic/fake-camera checks passed: 114 unittest checks
+- Camera-free GUI and synthetic/fake-camera checks passed: 115 unittest checks
   plus four metric checks. Updated stale defaults/layout and tuning fixtures;
   interference tuning algorithms are unchanged. Hardware validation remains due.
 

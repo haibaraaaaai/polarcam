@@ -1691,6 +1691,7 @@ class BasicVideoPlayer:
         self._live_exp_ms_var = self._camera_exp_ms_var
         self._live_gain_var = self._camera_gain_var
         self._live_status_var = tk.StringVar(value="Live feed stopped")
+        self._live_camera_error = None
         self._live_theta_var = tk.StringVar(value="")
         self._live_mag_enabled_var = tk.BooleanVar(value=True)
         self._live_background_subtract_var = tk.BooleanVar(value=False)
@@ -4299,6 +4300,9 @@ class BasicVideoPlayer:
                 cy = max(0.0, min(float(h - 1), cy))
         return (cx, cy)
 
+    def _live_on_error(self, message: object) -> None:
+        self._live_camera_error = str(message)
+
     def _live_on_frame(self, arr_obj: object) -> None:
         if not self._live_running:
             return
@@ -5627,6 +5631,8 @@ class BasicVideoPlayer:
         self._live_app = QApplication.instance() or QApplication([])
         self._live_queue = queue.Queue(maxsize=2)
         self._live_controller = Controller()
+        self._live_camera_error = None
+        self._live_controller.cam.error.connect(self._live_on_error)
         try:
             self.root.update_idletasks()
         except Exception:
@@ -5641,18 +5647,16 @@ class BasicVideoPlayer:
                 pass
         try:
             self._live_controller.open()
+            if self._live_camera_error:
+                raise RuntimeError(self._live_camera_error)
             self._live_controller.full_sensor()
             self._live_controller.set_timing(10.0, float(exp_ms))
             self._live_controller.set_gains(float(gain), None)
             self._live_controller.start()
             self._live_controller.cam.frame.connect(self._live_on_frame)
         except Exception as e:
-            try:
-                self._live_controller.close()
-            except Exception:
-                pass
-            self._live_controller = None
-            messagebox.showerror("Live feed", f"Could not start live feed: {e}")
+            self._stop_live_feed()
+            self._live_status_var.set(f"Live feed unavailable: {e}")
             return
 
         self._live_running = True
@@ -5660,7 +5664,7 @@ class BasicVideoPlayer:
             self._live_start_btn.state(["disabled"])
         if self._live_stop_btn is not None:
             self._live_stop_btn.state(["!disabled"])
-        self._live_status_var.set("Live feed running (10 fps)")
+        self._live_status_var.set("Waiting for camera frames…")
         self._live_tick()
 
     def _stop_live_feed(self) -> None:
@@ -5680,6 +5684,10 @@ class BasicVideoPlayer:
                 pass
             self._live_after_id = None
         if self._live_controller is not None:
+            try:
+                self._live_controller.cam.error.disconnect(self._live_on_error)
+            except Exception:
+                pass
             try:
                 self._live_controller.cam.frame.disconnect(self._live_on_frame)
             except Exception:
@@ -5718,6 +5726,12 @@ class BasicVideoPlayer:
         if not self._live_running:
             return
 
+        if self._live_camera_error:
+            error = self._live_camera_error
+            self._stop_live_feed()
+            self._live_status_var.set(f"Live feed unavailable: {error}")
+            return
+
         frame = None
         try:
             while True:
@@ -5726,6 +5740,7 @@ class BasicVideoPlayer:
             pass
 
         if frame is not None and self._live_img_label is not None:
+            self._live_status_var.set("Live frames received (10 fps requested)")
             try:
                 self._update_live_tracking(frame)
                 frame_display = self._apply_live_display_stretch(frame)

@@ -850,6 +850,18 @@ class IntensityLifecycleTests(unittest.TestCase):
             self.assertEqual(signal.callbacks, [])
         self.errors.assert_not_called()
 
+    def test_live_status_requires_frames_and_reports_camera_errors(self):
+        self.player._start_live_feed()
+        self.assertIn("Waiting", self.player._live_status_var.get())
+        live = self.controllers[-1]
+        live.cam.error.emit("No device found")
+        self.player._live_tick()
+        self.assertFalse(self.player._live_running)
+        self.assertIsNone(self.player._live_controller)
+        self.assertIn("No device found", self.player._live_status_var.get())
+        self.assertEqual(live.cam.error.callbacks, [])
+        live.close.assert_called_once()
+
     def test_returned_live_frames_update_the_magnifier(self):
         self.start_analyser()
         self.player._live_intensity_stop_btn.invoke()

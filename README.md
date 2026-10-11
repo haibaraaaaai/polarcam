@@ -156,7 +156,7 @@ Both commands are needed for the current suite:
 ```
 
 The second file contains standalone functions that `unittest` discovery does not
-run. The 11 October camera-free pass covered 114 unittest checks and four metric
+run. The 11 October camera-free pass covered 115 unittest checks and four metric
 checks. Synthetic checks do not establish actual FPS, lost-frame behaviour, stage
 response or experimental accuracy. Remaining historical findings are recorded in
 [the rewrite notes](docs/archive/REWRITE_NOTES.md#other-deferred-findings).
