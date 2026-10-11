@@ -43,6 +43,7 @@ from pol_reconstruction import make_qu_reconstructor
 from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
 from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope, roi_channel_means
 from polarcam.live import intensity_spots
+from polarcam.live.acquisition_helpers import (preview_u8, capture_path, filename_label, brightness_source, spot_brightness, BRIGHTNESS_EDGES)
 from polarcam.live.background_profiles import read_background_profile, save_active_background
 
 
@@ -234,57 +235,11 @@ def _safe_csd(
     )
 
 
-def _to_gray_u8(frame: np.ndarray) -> np.ndarray:
-    """
-    Return a contiguous (H,W) uint8 frame.
-
-    AVI frames arrive as BGR; NPY frames might be (H,W), (H,W,C), uint8/uint16/float.
-    For non-uint8 inputs, apply a simple *global* downscale heuristic (no per-frame
-    contrast normalization) so downstream processing stays consistent over time.
-    """
-    if frame is None:
+def _to_gray_u8(frame: np.ndarray) -> Optional[np.ndarray]:
+    try:
+        return preview_u8(frame)
+    except (ValueError, TypeError):
         return None
-    if frame.ndim == 3:
-        try:
-            frame = cv2.extractChannel(frame, 0)  # preserves dtype
-        except Exception:
-            frame = frame[..., 0]
-
-    x = np.asarray(frame)
-    if x.ndim != 2:
-        return None
-
-    if x.dtype == np.uint8:
-        return np.ascontiguousarray(x)
-
-    if np.issubdtype(x.dtype, np.integer):
-        maxv = int(x.max()) if x.size else 0
-        if maxv <= 255:
-            out = x.astype(np.uint8, copy=False)
-        elif maxv <= 4095:
-            out = (x.astype(np.uint16, copy=False) >> 4).astype(np.uint8, copy=False)
-        else:
-            out = (x.astype(np.uint32, copy=False) >> 8).astype(np.uint8, copy=False)
-        return np.ascontiguousarray(out)
-
-    if np.issubdtype(x.dtype, np.floating):
-        # Avoid large temporary copies (x[np.isfinite(x)]) on big frames.
-        maxv = float(np.nanmax(x)) if x.size else 0.0
-        if not np.isfinite(maxv):
-            finite_mask = np.isfinite(x)
-            maxv = float(x[finite_mask].max()) if finite_mask.any() else 0.0
-        if maxv <= 1.0:
-            y = x * 255.0
-        elif maxv <= 255.0:
-            y = x
-        elif maxv <= 4095.0:
-            y = x / 16.0
-        else:
-            y = x / 256.0
-        out = np.clip(y, 0.0, 255.0).astype(np.uint8)
-        return np.ascontiguousarray(out)
-
-    return np.ascontiguousarray(x.astype(np.uint8))
 
 
 class BasicVideoPlayer:
@@ -374,9 +329,6 @@ class BasicVideoPlayer:
     }
     STATIONARY_DATASET_DIRNAME = "stationary rods 25nm 02072026"
     CAPTURE_DEFAULT_SAVE_DIRNAME = str(Path("datasets") / "attempt240nmsoundonbuffer")
-    STATIONARY_DATASET_PENDING_DIR = "pending"
-    STATIONARY_DATASET_GOOD_DIR = "good"
-    STATIONARY_DATASET_BAD_DIR = "bad"
     RECORDINGS_ROOT_DIRNAME = "recordings"
     RECORDINGS_WIDEFIELD_DIRNAME = "stationary rods 25nm 02072026"
     RECORDINGS_SPOT_DIRNAME = "spots"
@@ -709,14 +661,12 @@ class BasicVideoPlayer:
         return Path.cwd() / self.BACKGROUND_PROFILE_FILENAME
 
     def _background_profiles_dir(self) -> Path:
-        out = Path.cwd() / self.BACKGROUNDS_DIRNAME
+        out = self._session_dir() / "backgrounds"
         out.mkdir(parents=True, exist_ok=True)
         return out
 
     def _datasets_initial_dir(self) -> Path:
-        out = Path.cwd() / self.DATASETS_ROOT_DIRNAME
-        out.mkdir(parents=True, exist_ok=True)
-        return out
+        return self._session_dir()
 
     def _set_active_background_profile(
         self, profile: np.ndarray, source_path: Optional[Path] = None, *, refresh_ui: bool = True,
@@ -753,17 +703,24 @@ class BasicVideoPlayer:
         shape_txt = f" {int(prof.shape[1])}x{int(prof.shape[0])}"
         source = getattr(self, "_background_profile_metadata", {}).get("background_profile_source_path")
         name = Path(source).name if source else f"{path.name}; source unknown"
-        self._background_profile_info_var.set(f"Background profile:{shape_txt} ({name})")
+        digest = getattr(self, "_background_profile_metadata", {}).get("background_profile_sha256", "")
+        self._background_profile_info_var.set(f"BG: {name} |{shape_txt} | ID {digest[:12]}")
 
     def _background_capture_args(self) -> list[str]:
         path = self._find_background_profile_path()
         if path is None:
             raise RuntimeError("Select a background profile before recording with subtraction.")
         _, metadata = read_background_profile(path)
-        return [
-            "--subtract-background", "--background-profile", metadata["background_profile_path"],
-            "--background-profile-sha256", metadata["background_profile_sha256"],
-        ]
+        frozen = self._background_profiles_dir() / "used" / (metadata["background_profile_sha256"] + ".npy")
+        frozen.parent.mkdir(parents=True, exist_ok=True)
+        if not frozen.exists():
+            shutil.copy2(path, frozen)
+            self._write_json_atomic(frozen.with_suffix(".json"), metadata)
+        _, pinned = read_background_profile(frozen)
+        if pinned["background_profile_sha256"] != metadata["background_profile_sha256"]:
+            raise RuntimeError("Background changed while preparing capture; please retry.")
+        return ["--subtract-background", "--background-profile", str(frozen),
+                "--background-profile-sha256", pinned["background_profile_sha256"]]
 
     def _background_average_frame_path(self, source_path: Path) -> Path:
         return source_path.with_name(f"{source_path.stem} average frame{source_path.suffix}")
@@ -798,6 +755,9 @@ class BasicVideoPlayer:
         return mean_frame, source_was_stack
 
     def _select_background_profile_stack(self) -> None:
+        if self._acquisition_busy():
+            messagebox.showinfo("Background profile", "Finish the current acquisition before changing background.")
+            return
         path = filedialog.askopenfilename(
             title="Select background NPY recording",
             initialdir=str(self._background_profiles_dir()),
@@ -932,9 +892,16 @@ class BasicVideoPlayer:
                 arr = self._strip_phase_marker_frame(arr)
                 if arr.ndim != 3:
                     raise RuntimeError(f"Expected full-field frame stack, got shape {tuple(arr.shape)}.")
-                min_frame = np.min(arr.astype(np.float32, copy=False), axis=0)
-                profile_path = out_dir / (
-                    f"background_min_{ts}_exp{float(exp_ms):.4g}ms_gain{float(gain):.4g}.npy"
+                min_frame = np.array(arr[0], dtype=np.float32)
+                for frame in arr[1:]:
+                    np.minimum(min_frame, frame, out=min_frame)
+                mmap = getattr(arr, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                del arr
+                profile_path = capture_path(
+                    out_dir, "background_min", sound_meta.get("conditions_at_start", {}).get("filename_label", ""),
+                    timestamp=f"{ts}_exp{float(exp_ms):.4g}ms_gain{float(gain):.4g}",
                 )
                 np.save(profile_path, min_frame.astype(np.float32, copy=False))
                 active_path = self._set_active_background_profile(min_frame, profile_path, refresh_ui=False)
@@ -1246,6 +1213,8 @@ class BasicVideoPlayer:
         args = [
             sys.executable,
             str(script),
+            "--out-path",
+            str(out_path),
             "--out-dir",
             str(out_dir),
             "--n-frames",
@@ -1332,7 +1301,7 @@ class BasicVideoPlayer:
         try:
             out_dir = self._infill_training_stacks_dir()
             ts = time.strftime("%Y%m%d-%H%M%S")
-            out_path = out_dir / f"frame_stack_{ts}.npy"
+            out_path = capture_path(out_dir, "frame_stack", (conditions or {}).get("filename_label", ""), timestamp=ts)
             self._ui_call(self.bottom_var.set, f"Fetching {n_frames} frame(s) to {out_dir}...")
             saved_path, actual_fps = self._capture_frames_to_npy(
                 out_path, n_frames, fps, exp_ms, gain_analog, subtract_background,
@@ -1427,7 +1396,14 @@ class BasicVideoPlayer:
             self._flat_warned_mismatch = False
 
     def _on_live_background_toggle(self) -> None:
-        self._live_background_subtract_enabled = bool(self._live_background_subtract_var.get())
+        enabled = bool(self._live_background_subtract_var.get())
+        if enabled and self._load_background_profile() is None:
+            self._live_background_subtract_var.set(False)
+            messagebox.showinfo("Background subtraction", "Select or capture a background first.")
+            enabled = False
+        self._live_background_subtract_enabled = enabled
+        if enabled:
+            self._save_background_subtract_var.set(True)
         if self._live_intensity_running:
             self._prepare_live_intensity_background()
 
@@ -1508,9 +1484,15 @@ class BasicVideoPlayer:
         self._capture_role_var = tk.StringVar(value="Sample")
         self._interference_state_var = tk.StringVar(value="Unknown")
         self._capture_condition_note_var = tk.StringVar(value="")
+        self._filename_label_var = tk.StringVar(value="")
+        self._session_dir_var = tk.StringVar(value="")
+        self._save_background_subtract_var = tk.BooleanVar(value=False)
+        self._brightness_peak = None
+        self._brightness_frames = 0
+        self._brightness_summary_var = tk.StringVar(value="Load or capture frames to measure spot brightness.")
         self._experiment_var = tk.StringVar(value="hinges")
         self._experiment_kind = "hinges"
-        self._session_id = time.strftime("%Y-%m-%d_%H%M%S")
+        self._session_id = time.strftime("%Y-%m-%d")
         self._session_root_override = None
         self._manual_spot_edits = {}
         self._manual_add_armed = False
@@ -1567,7 +1549,7 @@ class BasicVideoPlayer:
         self._fetch_fps_var = tk.StringVar(value="78")
         self._fetch_n_var = tk.StringVar(value="150")
         self._fetch_dur_var = tk.StringVar(value="")
-        self._fetch_background_subtract_var = tk.BooleanVar(value=False)
+        self._fetch_background_subtract_var = self._save_background_subtract_var
         self._fetch_btn = None
         self._fetch_close_btn = None
         self._sync_fetch_from("fps")
@@ -1670,7 +1652,7 @@ class BasicVideoPlayer:
         self._spotrec_fps_var = tk.StringVar(value="2000")
         self._spotrec_exp_ms_var = self._camera_exp_ms_var
         self._spotrec_gain_analog_var = self._camera_gain_var
-        self._spotrec_background_subtract_var = tk.BooleanVar(value=False)
+        self._spotrec_background_subtract_var = self._save_background_subtract_var
         self._spotrec_size_var = tk.StringVar(value="14")
         self._spotrec_spot_var = tk.StringVar(value="Spot - / -")
         self._spotrec_status_var = tk.StringVar(value="Idle")
@@ -1710,10 +1692,10 @@ class BasicVideoPlayer:
         self._live_gain_var = self._camera_gain_var
         self._live_status_var = tk.StringVar(value="Live feed stopped")
         self._live_theta_var = tk.StringVar(value="")
-        self._live_mag_enabled_var = tk.BooleanVar(value=False)
+        self._live_mag_enabled_var = tk.BooleanVar(value=True)
         self._live_background_subtract_var = tk.BooleanVar(value=False)
         self._live_background_subtract_enabled = False
-        self._live_capture_background_subtract_var = tk.BooleanVar(value=False)
+        self._live_capture_background_subtract_var = self._save_background_subtract_var
         self._live_background_capture_btn = None
         self._live_background_select_btn = None
         self._live_display_stretch_var = tk.BooleanVar(value=False)
@@ -1851,7 +1833,7 @@ class BasicVideoPlayer:
             value=f"{self.STATIONARY_REC_MAX_FPS_EST_DEFAULT:.1f}"
         )
         self._stationary_capture_gain_analog_var = self._camera_gain_var
-        self._stationary_capture_background_subtract_var = tk.BooleanVar(value=False)
+        self._stationary_capture_background_subtract_var = self._save_background_subtract_var
         self._stationary_capture_status_var = tk.StringVar(value="Stationary capture idle.")
         self._stationary_capture_running = False
         self._stationary_capture_lock = threading.Lock()
@@ -1863,25 +1845,6 @@ class BasicVideoPlayer:
         self._stationary_spot_ref = None
         self._stationary_xy_ref = None
         self._stationary_phi_ref = None
-        self._stationary_review_status_var = tk.StringVar(value="Pending 0 | Good 0")
-        self._stationary_review_detail_var = tk.StringVar(value="No stationary recordings yet.")
-        self._stationary_review_theta_var = tk.StringVar(value="")
-        self._stationary_review_include_var = tk.BooleanVar(value=False)
-        self._stationary_review_include_sync = False
-        self._stationary_review_sort_var = tk.StringVar(value="Newest first")
-        self._stationary_review_idx = 0
-        self._stationary_review_items: list[tuple[str, Path]] = []
-        self._stationary_review_prev_btn = None
-        self._stationary_review_next_btn = None
-        self._stationary_review_mark_chk = None
-        self._stationary_review_bad_btn = None
-        self._stationary_review_xy77_label = None
-        self._stationary_review_xymax_label = None
-        self._stationary_review_hist_label = None
-        self._stationary_review_xy77_ref = None
-        self._stationary_review_xymax_ref = None
-        self._stationary_review_hist_ref = None
-        self._stationary_dataset_tab = None
         self._play_popup = None
         self._play_running = False
         self._play_after_id = None
@@ -1925,19 +1888,13 @@ class BasicVideoPlayer:
 
         self._build_ui()
         for variable in (self._capture_role_var, self._interference_state_var,
-                         self._capture_condition_note_var, self._detection_mode_var):
+                         self._capture_condition_note_var, self._filename_label_var, self._detection_mode_var):
             variable.trace_add("write", lambda *_: self._sync_capture_conditions())
         self._sync_capture_conditions()
         self._refresh_save_dir_labels()
         self._update_spotrec_label()
         self._start_ui_pump()
         self._spotrec_size_var.trace_add("write", lambda *_: self._spotrec_update_preview(gray_frame=self._live_last_frame))
-        self._stationary_review_include_var.trace_add(
-            "write", lambda *_: self._on_stationary_review_include_toggle()
-        )
-        self._stationary_review_sort_var.trace_add(
-            "write", lambda *_: self._stationary_review_refresh(True)
-        )
 
     def _build_ui(self) -> None:
         global_bar = ttk.Frame(self.root, padding=(8, 6, 8, 2))
@@ -1947,7 +1904,7 @@ class BasicVideoPlayer:
                                  values=("hinges", "bfm"), state="readonly", width=8)
         experiment.pack(side=tk.LEFT, padx=4)
         experiment.bind("<<ComboboxSelected>>", self._change_experiment)
-        ttk.Button(global_bar, text="Session folder…", command=self._choose_session_dir).pack(side=tk.LEFT, padx=6)
+        ttk.Button(global_bar, text="Recording folder…", command=self._choose_session_dir).pack(side=tk.LEFT, padx=6)
         ttk.Label(global_bar, text="Drive (manual)").pack(side=tk.LEFT)
         ttk.Combobox(global_bar, textvariable=self._interference_state_var,
                      values=("Unknown", "On", "Off"), state="readonly", width=8).pack(side=tk.LEFT)
@@ -1957,6 +1914,14 @@ class BasicVideoPlayer:
                      state="readonly", width=16).pack(side=tk.LEFT)
         ttk.Button(global_bar, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.LEFT, padx=(12, 0))
 
+        folder = ttk.Frame(self.root, padding=(8, 0, 8, 4))
+        folder.pack(fill=tk.X)
+        ttk.Label(folder, textvariable=self._session_dir_var).pack(side=tk.LEFT)
+        label_row = ttk.Frame(self.root, padding=(8, 0, 8, 4))
+        label_row.pack(fill=tk.X)
+        ttk.Label(label_row, text="Filename label").pack(side=tk.LEFT)
+        ttk.Entry(label_row, textvariable=self._filename_label_var, width=30).pack(side=tk.LEFT, padx=8)
+        ttk.Label(label_row, text="Appended to timestamps for frame stacks, backgrounds and spot captures").pack(side=tk.LEFT)
         notes = ttk.Frame(self.root, padding=(8, 0, 8, 4))
         notes.pack(fill=tk.X)
         ttk.Label(notes, text="Sample / illumination / pair ID / notes (saved with captures)").pack(side=tk.LEFT)
@@ -1968,19 +1933,16 @@ class BasicVideoPlayer:
         self._live_tab = ttk.Frame(notebook)
         self._analysis_tab = ttk.Frame(notebook)
         self._stationary_tab = ttk.Frame(notebook)
-        self._stationary_dataset_tab = ttk.Frame(notebook)
         self._spotrec_tab = ttk.Frame(notebook)
         notebook.add(self._live_tab, text="Live video")
         notebook.add(self._analysis_tab, text="Spot analysis")
         notebook.add(self._stationary_tab, text="Stationary rods")
-        notebook.add(self._stationary_dataset_tab, text="Stationary dataset")
         notebook.add(self._spotrec_tab, text="Spot examine")
         notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         self._build_live_ui(self._live_tab)
         self._build_analysis_ui(self._analysis_tab)
         self._build_stationary_ui(self._stationary_tab)
-        self._build_stationary_dataset_ui(self._stationary_dataset_tab)
         self._build_spotrec_ui(self._spotrec_tab)
 
     def _build_live_ui(self, parent: tk.Widget) -> None:
@@ -2000,26 +1962,27 @@ class BasicVideoPlayer:
         ttk.Entry(top, textvariable=self._live_gain_var, width=7).pack(side=tk.LEFT)
         ttk.Button(top, text="Apply", command=self._apply_live_settings).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Checkbutton(top, text="Magnifier", variable=self._live_mag_enabled_var).pack(side=tk.LEFT, padx=(12, 0))
+        bg_row = ttk.Frame(parent, padding=(8, 0, 8, 4))
+        bg_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Checkbutton(
-            top,
+            bg_row,
             text="Subtract background",
             variable=self._live_background_subtract_var,
             command=self._on_live_background_toggle,
         ).pack(side=tk.LEFT, padx=(8, 0))
         self._live_background_select_btn = ttk.Button(
-            top,
+            bg_row,
             text="Select background NPY",
             command=self._select_background_profile_stack,
         )
         self._live_background_select_btn.pack(side=tk.LEFT, padx=(6, 0))
         self._live_background_capture_btn = ttk.Button(
-            top,
+            bg_row,
             text="Capture background",
             command=self._capture_background_profile_from_live_settings,
         )
         self._live_background_capture_btn.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(top, text="Choose save folder", command=self._choose_stationary_save_dir).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Label(top, textvariable=self._background_profile_info_var).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(bg_row, textvariable=self._background_profile_info_var).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Label(top, text="Zoom x").pack(side=tk.LEFT, padx=(6, 0))
         ttk.Entry(top, textvariable=self._live_zoom_var, width=5).pack(side=tk.LEFT)
 
@@ -2051,7 +2014,7 @@ class BasicVideoPlayer:
         right.bind("<Configure>", lambda _event: right_canvas.configure(scrollregion=right_canvas.bbox("all")))
         right_canvas.bind("<Configure>", lambda event: right_canvas.itemconfigure(right_window, width=event.width))
         self._live_controls_canvas = right_canvas
-        ttk.Label(parent, textvariable=self._stationary_save_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
+        ttk.Label(parent, textvariable=self._session_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
             side=tk.TOP, anchor="w", fill=tk.X
         )
         self._live_zoom_label = tk.Label(right, bg="black")
@@ -2193,7 +2156,7 @@ class BasicVideoPlayer:
         top.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(top, text="Select AVI/NPY", command=self.open_video).pack(side=tk.LEFT)
-        self._fetch_btn = ttk.Button(top, text="Fetch frames", command=self._on_fetch_frames)
+        self._fetch_btn = ttk.Button(top, text="Capture frame stack", command=self._on_fetch_frames)
         self._fetch_btn.pack(side=tk.LEFT, padx=(8, 0))
         self._fetch_close_btn = ttk.Button(top, text="Close loaded file", command=self._close_loaded_source)
         self._fetch_close_btn.pack(side=tk.LEFT, padx=(8, 0))
@@ -2207,15 +2170,16 @@ class BasicVideoPlayer:
         ttk.Entry(top, textvariable=self._fetch_n_var, width=7).pack(side=tk.LEFT)
         ttk.Label(top, text="Dur (s)").pack(side=tk.LEFT, padx=(10, 0))
         ttk.Entry(top, textvariable=self._fetch_dur_var, width=8).pack(side=tk.LEFT)
+        save_row = ttk.Frame(parent, padding=(8, 0, 8, 4))
+        save_row.pack(side=tk.TOP, fill=tk.X)
         ttk.Checkbutton(
-            top,
+            save_row,
             text="Save with background subtraction",
             variable=self._fetch_background_subtract_var,
         ).pack(side=tk.LEFT, padx=(10, 0))
-        ttk.Button(top, text="Choose save folder", command=self._choose_fetch_save_dir).pack(side=tk.LEFT, padx=(8, 0))
-        ttk.Label(top, text="Uses stored background profile").pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(save_row, textvariable=self._background_profile_info_var).pack(side=tk.LEFT, padx=(6, 0))
         self.status_var = tk.StringVar(value="No video loaded")
-        ttk.Label(top, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(save_row, textvariable=self.status_var).pack(side=tk.LEFT, padx=(12, 0))
         conditions = ttk.Frame(parent, padding=(8, 0, 8, 4))
         conditions.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(conditions, text="Detection").pack(side=tk.LEFT)
@@ -2288,6 +2252,15 @@ class BasicVideoPlayer:
         ttk.Button(edits, text="Add spot: click map", command=self._arm_add_spot).pack(side=tk.LEFT)
         ttk.Button(edits, text="Remove selected", command=self._remove_manual_spot).pack(side=tk.LEFT, padx=4)
 
+        brightness = ttk.LabelFrame(controls, text="Spot brightness — no display gain")
+        brightness.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(brightness, textvariable=self._brightness_summary_var, wraplength=335, justify=tk.LEFT).pack(fill=tk.X)
+        self._brightness_table = ttk.Treeview(brightness, columns=("range", "count"), show="headings", height=11)
+        self._brightness_table.heading("range", text="Peak pixel (0–255)")
+        self._brightness_table.heading("count", text="Spots")
+        self._brightness_table.column("range", width=200, stretch=True)
+        self._brightness_table.column("count", width=90, stretch=False, anchor="e")
+        self._brightness_table.pack(fill=tk.X)
         params = ttk.Frame(controls)
         params.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
         ttk.Label(params, text="DoG k").grid(row=0, column=0, sticky="w")
@@ -2428,9 +2401,6 @@ class BasicVideoPlayer:
             capture, text="Record all stationary", command=self._stationary_capture_all
         )
         self._stationary_capture_all_btn.pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(capture, text="Choose save folder", command=self._choose_stationary_save_dir).pack(
-            side=tk.LEFT, padx=(8, 0)
-        )
 
         capture_status = ttk.Frame(parent, padding=(8, 2, 8, 2))
         capture_status.pack(side=tk.TOP, fill=tk.X)
@@ -2463,76 +2433,6 @@ class BasicVideoPlayer:
 
         self._update_stationary_view()
 
-    def _build_stationary_dataset_ui(self, parent: tk.Widget) -> None:
-        top = ttk.Frame(parent, padding=8)
-        top.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(top, text="Refresh dataset", command=self._stationary_review_refresh).pack(
-            side=tk.LEFT
-        )
-        ttk.Label(top, text="Sort pending").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.OptionMenu(
-            top,
-            self._stationary_review_sort_var,
-            self._stationary_review_sort_var.get(),
-            "Newest first",
-            "Brightness high to low",
-            "XY p86-p14 low to high",
-            "Radius high to low",
-        ).pack(side=tk.LEFT)
-        ttk.Label(top, textvariable=self._stationary_review_status_var).pack(side=tk.LEFT, padx=(12, 0))
-        ttk.Label(top, textvariable=self._stationary_review_theta_var).pack(side=tk.RIGHT)
-
-        nav = ttk.Frame(parent, padding=(8, 0, 8, 0))
-        nav.pack(side=tk.TOP, fill=tk.X)
-        self._stationary_review_prev_btn = ttk.Button(
-            nav, text="<", width=3, command=self._stationary_review_prev
-        )
-        self._stationary_review_prev_btn.pack(side=tk.LEFT)
-        self._stationary_review_next_btn = ttk.Button(
-            nav, text=">", width=3, command=self._stationary_review_next
-        )
-        self._stationary_review_next_btn.pack(side=tk.LEFT, padx=(4, 8))
-        self._stationary_review_mark_chk = ttk.Checkbutton(
-            nav,
-            text="Accept manually (moves to good; not automatic QC)",
-            variable=self._stationary_review_include_var,
-        )
-        self._stationary_review_mark_chk.pack(side=tk.LEFT)
-        self._stationary_review_bad_btn = ttk.Button(
-            nav,
-            text="Reject manually (keeps files in bad)",
-            command=self._stationary_review_mark_current_bad,
-        )
-        self._stationary_review_bad_btn.pack(side=tk.LEFT, padx=(8, 0))
-
-        ttk.Label(
-            parent,
-            textvariable=self._stationary_review_detail_var,
-            padding=(8, 6, 8, 2),
-            justify=tk.LEFT,
-        ).pack(side=tk.TOP, anchor="w", fill=tk.X)
-
-        plots = ttk.Frame(parent, padding=8)
-        plots.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        plots.columnconfigure(0, weight=1)
-        plots.columnconfigure(1, weight=1)
-        plots.rowconfigure(0, weight=1)
-        plots.rowconfigure(1, weight=1)
-
-        ttk.Label(plots, text="XY trace (legacy 77fps mode)").grid(row=0, column=0, sticky="w")
-        ttk.Label(plots, text="XY trace (max-fps 14x14 mode)").grid(row=0, column=1, sticky="w")
-        self._stationary_review_xy77_label = ttk.Label(plots)
-        self._stationary_review_xy77_label.grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        self._stationary_review_xymax_label = ttk.Label(plots)
-        self._stationary_review_xymax_label.grid(row=1, column=1, sticky="nsew", padx=(8, 0))
-
-        hist_row = ttk.Frame(parent, padding=(8, 0, 8, 8))
-        hist_row.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        ttk.Label(hist_row, text="Accepted rods: theta coverage").pack(side=tk.TOP, anchor="w")
-        self._stationary_review_hist_label = ttk.Label(hist_row)
-        self._stationary_review_hist_label.pack(side=tk.TOP, anchor="w")
-
-        self._stationary_review_refresh()
 
     def _build_spotrec_ui(self, parent: tk.Widget) -> None:
         top = ttk.Frame(parent, padding=8)
@@ -2553,24 +2453,22 @@ class BasicVideoPlayer:
         ttk.Entry(top, textvariable=self._spotrec_gain_analog_var, width=7).pack(side=tk.LEFT)
         ttk.Checkbutton(
             top,
-            text="Subtract background",
+            text="Save with background subtraction",
             variable=self._spotrec_background_subtract_var,
         ).pack(side=tk.LEFT, padx=(12, 0))
         ttk.Label(top, text="ROI size (sensor px)").pack(side=tk.LEFT, padx=(12, 0))
         ttk.Entry(top, textvariable=self._spotrec_size_var, width=5).pack(side=tk.LEFT)
-        ttk.Button(top, text="Choose save folder", command=self._choose_spotrec_save_dir).pack(
-            side=tk.LEFT, padx=(12, 0)
-        )
 
-        self._spotrec_save_btn = ttk.Button(top, text="Save recording", command=self._spotrec_save)
+        self._spotrec_save_btn = ttk.Button(top, text="Save copy…", command=self._spotrec_save)
         self._spotrec_save_btn.state(["disabled"])
         self._spotrec_save_btn.pack(side=tk.LEFT, padx=(12, 0))
-        self._spotrec_discard_btn = ttk.Button(top, text="Discard", command=self._spotrec_discard)
+        self._spotrec_discard_btn = ttk.Button(top, text="Close recording", command=self._spotrec_discard)
         self._spotrec_discard_btn.state(["disabled"])
         self._spotrec_discard_btn.pack(side=tk.LEFT, padx=(6, 0))
 
         ttk.Label(top, textvariable=self._spotrec_status_var).pack(side=tk.RIGHT)
         ttk.Label(top, textvariable=self._spotrec_progress_var).pack(side=tk.RIGHT, padx=(0, 12))
+        ttk.Label(parent, textvariable=self._background_profile_info_var, padding=(8, 0, 8, 4)).pack(fill=tk.X)
         ttk.Label(parent, textvariable=self._spotrec_save_dir_var, padding=(8, 0, 8, 4), justify=tk.LEFT, wraplength=1100).pack(
             side=tk.TOP, anchor="w", fill=tk.X
         )
@@ -3195,7 +3093,7 @@ class BasicVideoPlayer:
         if self._acquisition_busy():
             messagebox.showinfo("Session", "Stop recording/analysis before changing the session folder.")
             return
-        path = filedialog.askdirectory(title="Choose one session folder for all recording types",
+        path = filedialog.askdirectory(title="Choose recording folder (frames / backgrounds / spots / stationary)",
                                        initialdir=str(self._session_dir()))
         if path:
             self._session_root_override = Path(path)
@@ -3218,6 +3116,7 @@ class BasicVideoPlayer:
         return out
 
     def _refresh_save_dir_labels(self) -> None:
+        self._session_dir_var.set(f"Recording folder: {self._session_dir()}")
         try:
             self._fetch_save_dir_var.set(f"Save: {self._fetch_save_dir()}")
         except Exception:
@@ -3253,15 +3152,6 @@ class BasicVideoPlayer:
     def _infill_training_stacks_dir(self) -> Path:
         return self._fetch_save_dir()
 
-    def _stationary_dataset_paths(self) -> tuple[Path, Path, Path]:
-        root = self._stationary_dataset_root_dir()
-        pending = root / self.STATIONARY_DATASET_PENDING_DIR
-        good = root / self.STATIONARY_DATASET_GOOD_DIR
-        bad = root / self.STATIONARY_DATASET_BAD_DIR
-        pending.mkdir(parents=True, exist_ok=True)
-        good.mkdir(parents=True, exist_ok=True)
-        bad.mkdir(parents=True, exist_ok=True)
-        return root, pending, good
 
     def _write_json_atomic(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3277,6 +3167,7 @@ class BasicVideoPlayer:
             "recording_role": self._capture_role_var.get(),
             "interference_drive": state,
             "condition_note": self._capture_condition_note_var.get().strip(),
+            "filename_label": filename_label(self._filename_label_var.get()),
             "experiment": self._experiment_kind,
             "session_id": self._session_id,
             "source": "manual_operator_declaration_not_hardware_readback",
@@ -3336,7 +3227,6 @@ class BasicVideoPlayer:
         payload = {
             "schema_version": 2,
             "conditions": dict(sound.get("conditions_at_start", {})),
-            "review": {"status": "unreviewed", "source": "no_automatic_quality_classification"},
             "created_local": time.strftime("%Y-%m-%d %H:%M:%S"),
             "recording_type": str(recording_type),
             "npy_file": p.name,
@@ -4004,6 +3894,7 @@ class BasicVideoPlayer:
                 "max_saved_value": (
                     int(max_saved_value) if max_saved_value is not None else None
                 ),
+                "raw_peak": fetch_data.get("raw_peak"),
                 "background_subtracted": fetch_data.get("background_subtracted"),
                 "background_profile_path": fetch_data.get("background_profile_path"),
                 "background_profile_source_path": fetch_data.get("background_profile_source_path"),
@@ -4012,15 +3903,10 @@ class BasicVideoPlayer:
                 "max_pixel_value": (
                     float(np.max(arr)) if getattr(arr, "size", 0) else None
                 ),
-                "saturation_value": (
-                    float(np.iinfo(arr.dtype).max)
-                    if getattr(arr, "size", 0) and np.issubdtype(arr.dtype, np.integer)
-                    else None
-                ),
+                "saturation_value": 255 if arr.dtype == np.uint8 else 4095,
                 "fraction_saturated": (
-                    float(np.mean(arr == np.iinfo(arr.dtype).max))
-                    if getattr(arr, "size", 0) and np.issubdtype(arr.dtype, np.integer)
-                    else None
+                    float(np.mean(arr >= (255 if arr.dtype == np.uint8 else 4095)))
+                    if arr.size and not fetch_data.get("background_subtracted") else None
                 ),
                 "intensity_p98": (
                     float(np.percentile(arr, 98.0)) if getattr(arr, "size", 0) else None
@@ -4143,7 +4029,7 @@ class BasicVideoPlayer:
             n_ok = 0
             n_fail = 0
             try:
-                _, pending_dir, _ = self._stationary_dataset_paths()
+                out_dir = self._stationary_dataset_root_dir()
                 for i, cand in enumerate(targets, start=1):
                     center = cand.get("center")
                     if (
@@ -4160,8 +4046,8 @@ class BasicVideoPlayer:
                     cy_cap = float(cy) + float(off_y)
                     key = self._spot_center_key((cx_cap, cy_cap))
                     token = f"{time.strftime('%Y%m%d-%H%M%S')}_{time.time_ns()}"
-                    rod_id = f"rod_x{key[0]}_y{key[1]}_{token}"
-                    rod_dir = pending_dir / rod_id
+                    rod_id = f"rod_x{key[0]}_y{key[1]}_{token}" + ("_" + sound_meta["conditions_at_start"]["filename_label"] if sound_meta.get("conditions_at_start", {}).get("filename_label") else "")
+                    rod_dir = out_dir / rod_id
                     rod_dir.mkdir(parents=True, exist_ok=True)
 
                     self._ui_call(
@@ -4259,348 +4145,23 @@ class BasicVideoPlayer:
                 msg = f"Stationary capture finished: {n_ok} saved, {n_fail} failed."
                 self._ui_call(self._stationary_capture_status_var.set, msg)
                 self._ui_call(self.bottom_var.set, msg)
-                self._ui_call(self._stationary_review_refresh, True)
                 self._ui_call(self._set_stationary_capture_busy, False)
                 with self._stationary_capture_lock:
                     self._stationary_capture_running = False
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _stationary_review_load_json(self, path: Path) -> Optional[dict]:
-        try:
-            if not path.exists():
-                return None
-            text = path.read_text(encoding="utf-8")
-            data = json.loads(text)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            return None
-        return None
 
-    def _stationary_review_load_mode_meta(
-        self, rod_dir: Path, key: str, fallback_name: str
-    ) -> Optional[dict]:
-        root_meta = self._stationary_review_load_json(rod_dir / "meta.json") or {}
-        modes = root_meta.get("modes", {})
-        meta_name = None
-        if isinstance(modes, dict):
-            meta_name = modes.get(key)
-        if not meta_name:
-            meta_name = fallback_name
-        return self._stationary_review_load_json(rod_dir / str(meta_name))
 
-    def _stationary_review_pending_sort_key(self, rod_dir: Path) -> tuple:
-        sort_mode = str(self._stationary_review_sort_var.get() or "Newest first")
-        meta = self._stationary_review_load_json(rod_dir / "meta.json") or {}
-        mmax = self._stationary_review_load_mode_meta(
-            rod_dir, "capture_maxfps_15x15_meta", "capture_maxfps_15x15_meta.json"
-        ) or self._stationary_review_load_mode_meta(
-            rod_dir, "capture_maxfps_11x11_meta", "capture_maxfps_11x11_meta.json"
-        ) or {}
-        xy_metrics = dict(mmax.get("xy_metrics") or {})
-        actual = dict(mmax.get("actual") or {})
-        brightness = actual.get("intensity_p98")
-        motion = xy_metrics.get("motion_max_axis_range")
-        r_mean = xy_metrics.get("r_mean")
-        try:
-            brightness = float(brightness) if brightness is not None else float("nan")
-        except Exception:
-            brightness = float("nan")
-        try:
-            motion = float(motion) if motion is not None else float("nan")
-        except Exception:
-            motion = float("nan")
-        try:
-            r_mean = float(r_mean) if r_mean is not None else float("nan")
-        except Exception:
-            r_mean = float("nan")
-        if sort_mode == "Brightness high to low":
-            return (0 if np.isfinite(brightness) else 1, -(brightness if np.isfinite(brightness) else 0.0), rod_dir.name)
-        if sort_mode in ("XY p86-p14 low to high", "Max XY low to high"):
-            return (0 if np.isfinite(motion) else 1, (motion if np.isfinite(motion) else float("inf")), rod_dir.name)
-        if sort_mode == "Radius high to low":
-            return (0 if np.isfinite(r_mean) else 1, -(r_mean if np.isfinite(r_mean) else 0.0), rod_dir.name)
-        created = meta.get("created_local")
-        return (0, str(created or ""), rod_dir.name)
 
-    def _stationary_review_refresh(self, preserve_selection: bool = False) -> None:
-        _, pending_dir, good_dir = self._stationary_dataset_paths()
-        pending_dirs = sorted(
-            [p for p in pending_dir.iterdir() if p.is_dir()],
-            key=self._stationary_review_pending_sort_key,
-        )
-        good_dirs = sorted([p for p in good_dir.iterdir() if p.is_dir()])
-        prev_name = None
-        prev_state = None
-        if preserve_selection and self._stationary_review_items:
-            idx = max(
-                0,
-                min(int(self._stationary_review_idx), len(self._stationary_review_items) - 1),
-            )
-            prev_state, prev_dir = self._stationary_review_items[idx]
-            prev_name = prev_dir.name
-        # Review pane shows only pending rods; accepted ("good") rods are hidden.
-        items: list[tuple[str, Path]] = [("pending", p) for p in pending_dirs]
-        self._stationary_review_items = items
-        self._stationary_review_status_var.set(
-            f"Pending {len(pending_dirs)} | Good {len(good_dirs)} (hidden)"
-        )
-        if prev_name:
-            hit = None
-            for i, (state, p) in enumerate(items):
-                if p.name == prev_name and state == prev_state:
-                    hit = i
-                    break
-            if hit is None:
-                for i, (_, p) in enumerate(items):
-                    if p.name == prev_name:
-                        hit = i
-                        break
-            if hit is not None:
-                self._stationary_review_idx = int(hit)
-        self._stationary_review_update_theta_panel(good_dirs)
-        self._stationary_review_update_view()
 
-    def _stationary_review_update_theta_panel(self, good_dirs: list[Path]) -> None:
-        theta_vals: list[float] = []
-        for d in good_dirs:
-            meta = self._stationary_review_load_json(d / "meta.json") or {}
-            t = meta.get("theta_active_deg")
-            try:
-                if t is not None:
-                    t_f = float(t)
-                    if np.isfinite(t_f):
-                        theta_vals.append(t_f)
-            except Exception:
-                continue
 
-        if theta_vals:
-            arr = np.asarray(theta_vals, dtype=np.float64)
-            bins = np.arange(0.0, 100.0, 10.0)
-            hist, edges = np.histogram(arr, bins=bins)
-            parts = []
-            for i in range(len(hist)):
-                a = int(round(edges[i]))
-                b = int(round(edges[i + 1]))
-                parts.append(f"{a}-{b}:{int(hist[i])}")
-            self._stationary_review_theta_var.set(
-                f"Accepted theta(active, deg): n={arr.size}  " + " | ".join(parts)
-            )
-        else:
-            self._stationary_review_theta_var.set("Accepted theta(active, deg): n=0")
 
-        img = self._stationary_review_theta_image(theta_vals)
-        if self._stationary_review_hist_label is not None:
-            photo = ImageTk.PhotoImage(img)
-            self._stationary_review_hist_label.configure(image=photo)
-            self._stationary_review_hist_ref = photo
 
-    def _stationary_review_theta_image(self, theta_deg: list[float]) -> Image.Image:
-        if Figure is not None and FigureCanvas is not None:
-            fig = Figure(figsize=(3.2, 2.0), dpi=100)
-            ax = fig.add_subplot(111)
-            if theta_deg:
-                bins = np.arange(0.0, 100.0, 10.0)
-                ax.hist(theta_deg, bins=bins, color="tab:blue", alpha=0.85, edgecolor="black")
-            else:
-                ax.text(0.5, 0.5, "No accepted rods yet", ha="center", va="center", fontsize=9)
-                ax.set_xlim(0.0, 90.0)
-            ax.set_xlabel("theta (deg)", fontsize=8)
-            ax.set_ylabel("count", fontsize=8)
-            ax.tick_params(labelsize=8)
-            fig.tight_layout(pad=0.5)
-            return self._mpl_fig_to_image(fig)
 
-        w, h = 320, 200
-        img = Image.new("RGB", (w, h), color=(255, 255, 255))
-        draw = ImageDraw.Draw(img)
-        draw.rectangle((0, 0, w - 1, h - 1), outline=(0, 0, 0))
-        if not theta_deg:
-            draw.text((12, 14), "No accepted rods yet", fill=(0, 0, 0))
-            return img
-        draw.text((12, 14), f"n={len(theta_deg)} theta values", fill=(0, 0, 0))
-        bins = np.arange(0.0, 100.0, 10.0)
-        hist, _ = np.histogram(np.asarray(theta_deg, dtype=np.float64), bins=bins)
-        y = 36
-        for i, c in enumerate(hist):
-            draw.text((12, y), f"{int(bins[i]):02d}-{int(bins[i+1]):02d}: {int(c)}", fill=(0, 0, 0))
-            y += 14
-        return img
 
-    def _stationary_review_prev(self) -> None:
-        if not self._stationary_review_items:
-            return
-        n = len(self._stationary_review_items)
-        self._stationary_review_idx = (int(self._stationary_review_idx) - 1) % n
-        self._stationary_review_update_view()
 
-    def _stationary_review_next(self) -> None:
-        if not self._stationary_review_items:
-            return
-        n = len(self._stationary_review_items)
-        self._stationary_review_idx = (int(self._stationary_review_idx) + 1) % n
-        self._stationary_review_update_view()
 
-    def _stationary_review_update_view(self) -> None:
-        n = len(self._stationary_review_items)
-        if n <= 0:
-            self._stationary_review_detail_var.set("No stationary recordings.")
-            if self._stationary_review_prev_btn is not None:
-                self._stationary_review_prev_btn.configure(state=tk.DISABLED)
-            if self._stationary_review_next_btn is not None:
-                self._stationary_review_next_btn.configure(state=tk.DISABLED)
-            if self._stationary_review_mark_chk is not None:
-                self._stationary_review_mark_chk.configure(state=tk.DISABLED)
-            if self._stationary_review_bad_btn is not None:
-                self._stationary_review_bad_btn.configure(state=tk.DISABLED)
-            if self._stationary_review_xy77_label is not None:
-                self._stationary_review_xy77_label.configure(image="")
-            if self._stationary_review_xymax_label is not None:
-                self._stationary_review_xymax_label.configure(image="")
-            self._stationary_review_xy77_ref = None
-            self._stationary_review_xymax_ref = None
-            self._stationary_review_include_sync = True
-            self._stationary_review_include_var.set(False)
-            self._stationary_review_include_sync = False
-            return
-
-        self._stationary_review_idx = max(0, min(int(self._stationary_review_idx), n - 1))
-        entry_state, rod_dir = self._stationary_review_items[self._stationary_review_idx]
-        is_pending = entry_state == "pending"
-        if self._stationary_review_prev_btn is not None:
-            self._stationary_review_prev_btn.configure(state=tk.NORMAL)
-        if self._stationary_review_next_btn is not None:
-            self._stationary_review_next_btn.configure(state=tk.NORMAL)
-        if self._stationary_review_mark_chk is not None:
-            self._stationary_review_mark_chk.configure(
-                state=(tk.NORMAL if is_pending else tk.DISABLED)
-            )
-        if self._stationary_review_bad_btn is not None:
-            self._stationary_review_bad_btn.configure(
-                state=(tk.NORMAL if is_pending else tk.DISABLED)
-            )
-
-        meta = self._stationary_review_load_json(rod_dir / "meta.json") or {}
-        m77 = self._stationary_review_load_mode_meta(
-            rod_dir, "capture_77fps_meta", "capture_77fps_meta.json"
-        ) or {}
-        mmax = self._stationary_review_load_mode_meta(
-            rod_dir, "capture_maxfps_15x15_meta", "capture_maxfps_15x15_meta.json"
-        ) or self._stationary_review_load_mode_meta(
-            rod_dir, "capture_maxfps_11x11_meta", "capture_maxfps_11x11_meta.json"
-        ) or {}
-        xy77_raw = m77.get("xy_series", [])
-        xymax_raw = mmax.get("xy_series", [])
-        xy77 = [(float(v[0]), float(v[1])) for v in xy77_raw if isinstance(v, (list, tuple)) and len(v) >= 2]
-        xymax = [(float(v[0]), float(v[1])) for v in xymax_raw if isinstance(v, (list, tuple)) and len(v) >= 2]
-
-        if self._stationary_review_xy77_label is not None:
-            img77 = self._make_xy_scatter_image(xy77)
-            p77 = ImageTk.PhotoImage(img77)
-            self._stationary_review_xy77_label.configure(image=p77)
-            self._stationary_review_xy77_ref = p77
-        if self._stationary_review_xymax_label is not None:
-            imgm = self._make_xy_scatter_image(xymax)
-            pm = ImageTk.PhotoImage(imgm)
-            self._stationary_review_xymax_label.configure(image=pm)
-            self._stationary_review_xymax_ref = pm
-
-        t_active = meta.get("theta_active_deg")
-        active_label = meta.get("theta_active_medium", "active")
-        t_water = meta.get("theta_water_deg")
-        t_gly = meta.get("theta_glycerol50_deg")
-        c = meta.get("center_px", {})
-        c_x = c.get("x")
-        c_y = c.get("y")
-        m77m = m77.get("xy_metrics", {})
-        fps77 = m77.get("actual", {}).get("fps")
-        fpsm = mmax.get("actual", {}).get("fps")
-        status_txt = "Pending" if is_pending else "Good"
-        detail = (
-            f"{status_txt} {self._stationary_review_idx + 1}/{n}  |  {rod_dir.name}\n"
-            f"center=({c_x}, {c_y})\n"
-            f"theta_active={self._theta_deg_text(t_active)} deg ({active_label})\n"
-            f"theta_water={self._theta_deg_text(t_water)} deg\n"
-            f"theta_glycerol50={self._theta_deg_text(t_gly)} deg\n"
-        )
-        if m77:
-            detail += (
-                f"77fps fps={fps77}\n"
-                f"77fps frames={m77.get('actual', {}).get('frames')}\n"
-                f"77fps fov={m77.get('requested', {}).get('fov_raw_px')}\n"
-                f"77fps rangeX={m77m.get('range_x')}\n"
-                f"77fps rangeY={m77m.get('range_y')}\n"
-                f"77fps r_mean={m77m.get('r_mean')}\n"
-            )
-        detail += (
-            f"maxfps-14x14 fps={fpsm}\n"
-            f"maxfps-14x14 frames={mmax.get('actual', {}).get('frames')}"
-        )
-        self._stationary_review_detail_var.set(detail)
-
-        self._stationary_review_include_sync = True
-        self._stationary_review_include_var.set(False)
-        self._stationary_review_include_sync = False
-
-    def _on_stationary_review_include_toggle(self) -> None:
-        if self._stationary_review_include_sync:
-            return
-        if bool(self._stationary_review_include_var.get()):
-            self._stationary_review_mark_current_good()
-
-    def _stationary_review_mark_current_good(self) -> None:
-        if not self._stationary_review_items:
-            self._stationary_review_include_sync = True
-            self._stationary_review_include_var.set(False)
-            self._stationary_review_include_sync = False
-            return
-        idx = max(0, min(int(self._stationary_review_idx), len(self._stationary_review_items) - 1))
-        entry_state, src = self._stationary_review_items[idx]
-        if entry_state != "pending":
-            self._stationary_review_include_sync = True
-            self._stationary_review_include_var.set(False)
-            self._stationary_review_include_sync = False
-            return
-        _, _, good_dir = self._stationary_dataset_paths()
-        dst = good_dir / src.name
-        if dst.exists():
-            dst = good_dir / f"{src.name}_{time.time_ns()}"
-        try:
-            shutil.move(str(src), str(dst))
-            self._write_json_atomic(dst / "review.json", {"status": "accepted", "source": "manual_operator", "reviewed_local": time.strftime("%Y-%m-%d %H:%M:%S")})
-            self.bottom_var.set(f"Moved to good: {dst.name}")
-        except Exception as e:
-            messagebox.showerror("Stationary review", f"Could not move folder: {e}")
-        self._stationary_review_include_sync = True
-        self._stationary_review_include_var.set(False)
-        self._stationary_review_include_sync = False
-        self._stationary_review_refresh(True)
-
-    def _stationary_review_mark_current_bad(self) -> None:
-        if not self._stationary_review_items:
-            return
-        idx = max(0, min(int(self._stationary_review_idx), len(self._stationary_review_items) - 1))
-        entry_state, src = self._stationary_review_items[idx]
-        if entry_state != "pending":
-            return
-        root, _, _ = self._stationary_dataset_paths()
-        bad_dir = root / self.STATIONARY_DATASET_BAD_DIR
-        bad_dir.mkdir(parents=True, exist_ok=True)
-        dst = bad_dir / src.name
-        if dst.exists():
-            dst = bad_dir / f"{src.name}_{time.time_ns()}"
-        try:
-            shutil.move(str(src), str(dst))
-            self._write_json_atomic(dst / "review.json", {"status": "rejected", "source": "manual_operator", "reviewed_local": time.strftime("%Y-%m-%d %H:%M:%S")})
-            self.bottom_var.set(f"Moved to bad: {dst.name}")
-        except Exception as e:
-            messagebox.showerror("Stationary review", f"Could not move folder: {e}")
-            return
-        self._stationary_review_include_sync = True
-        self._stationary_review_include_var.set(False)
-        self._stationary_review_include_sync = False
-        self._stationary_review_refresh(True)
 
     def _reset_live_tracking(self, keep_shift: bool = False) -> None:
         self._live_track_prev = None
@@ -4745,7 +4306,7 @@ class BasicVideoPlayer:
             frame16 = np.asarray(arr_obj, dtype=np.uint16, copy=False)
             if bool(getattr(self, "_live_background_subtract_enabled", False)):
                 frame16 = self._subtract_background_frame(frame16, roi=None, base_dir=Path.cwd())
-            frame8 = (frame16 >> 4).astype(np.uint8, copy=False)
+            frame8 = preview_u8(frame16)
         except Exception:
             return
         self._live_last_frame = frame8
@@ -5863,17 +5424,7 @@ class BasicVideoPlayer:
         capture_duration_s = float(cfg["duration_s"])
         capture_roi_raw = int(cfg["roi_raw"])
         capture_subtract_background = bool(self._live_capture_background_subtract_var.get())
-        prev_live_exp = str(self._live_exp_ms_var.get())
-        prev_live_gain = str(self._live_gain_var.get())
-        prev_stationary_exp = str(self._stationary_capture_max_exp_ms_var.get())
-        prev_stationary_dur = str(self._stationary_capture_max_duration_s_var.get())
-        prev_stationary_fps = str(self._stationary_capture_max_fps_est_var.get())
 
-        self._live_exp_ms_var.set(f"{capture_exp_ms:.3f}")
-        self._live_gain_var.set(f"{capture_gain_analog:.2f}")
-        self._stationary_capture_max_exp_ms_var.set(f"{capture_exp_ms:.3f}")
-        self._stationary_capture_max_duration_s_var.set(f"{capture_duration_s:.3f}")
-        self._stationary_capture_max_fps_est_var.set(f"{capture_fps_req:.1f}")
 
         self._set_live_capture_busy(True)
         self._live_capture_status_var.set(
@@ -5884,10 +5435,10 @@ class BasicVideoPlayer:
 
         def _worker() -> None:
             try:
-                _, out_dir, _ = self._stationary_dataset_paths()
+                out_dir = self._stationary_dataset_root_dir()
                 key = self._spot_center_key(center)
                 token = f"{time.strftime('%Y%m%d-%H%M%S')}_{time.time_ns()}"
-                rod_id = f"rod_x{key[0]}_y{key[1]}_{token}"
+                rod_id = f"rod_x{key[0]}_y{key[1]}_{token}" + ("_" + sound_meta["conditions_at_start"]["filename_label"] if sound_meta.get("conditions_at_start", {}).get("filename_label") else "")
                 rod_dir = out_dir / rod_id
                 rod_dir.mkdir(parents=True, exist_ok=True)
                 mode_path = rod_dir / "capture_maxfps_15x15.npy"
@@ -5981,13 +5532,13 @@ class BasicVideoPlayer:
                     xy_series_cap,
                     center,
                 )
-                status_lines = [f"Saved to pending: {rod_id}"]
+                status_lines = [f"Saved to stationary: {rod_id}"]
                 if capture_subtract_background:
                     status_lines.append("background subtraction: on")
                 if p98_cap is not None:
                     status_lines.append(f"intensity_p98={p98_cap:.2f}")
                 if frac_255_cap is not None:
-                    status_lines.append(f"fraction_255={frac_255_cap:.6f}")
+                    status_lines.append(f"clipped pixel fraction={frac_255_cap:.6f}")
                 if r_mean_cap is not None:
                     status_lines.append(f"mean r={r_mean_cap:.3f}")
                 if valid_frac_cap is not None:
@@ -6004,11 +5555,6 @@ class BasicVideoPlayer:
                 self._ui_call(self._live_capture_status_var.set, f"Live capture failed: {e}")
                 self._ui_call(messagebox.showerror, "Live capture", str(e))
             finally:
-                self._ui_call(self._live_exp_ms_var.set, prev_live_exp)
-                self._ui_call(self._live_gain_var.set, prev_live_gain)
-                self._ui_call(self._stationary_capture_max_exp_ms_var.set, prev_stationary_exp)
-                self._ui_call(self._stationary_capture_max_duration_s_var.set, prev_stationary_dur)
-                self._ui_call(self._stationary_capture_max_fps_est_var.set, prev_stationary_fps)
                 self._ui_call(self._start_live_feed)
                 self._ui_call(self._set_live_capture_busy, False)
                 with self._live_capture_lock:
@@ -6601,9 +6147,9 @@ class BasicVideoPlayer:
         out_dir = self._spotrec_save_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = time.strftime("%Y%m%d-%H%M%S")
-        out_path = out_dir / f"spotrec_{ts}.npy"
-        preview_path = out_dir / f"spotrec_preview_{ts}.npy"
-        stop_flag = out_dir / f"spotrec_{ts}.stop"
+        out_path = capture_path(out_dir, "spotrec", self._capture_conditions_cache.get("filename_label", ""), timestamp=ts)
+        preview_path = out_path.with_name(out_path.stem + "_preview.npy")
+        stop_flag = out_path.with_suffix(".stop")
         try:
             stop_flag.unlink(missing_ok=True)
         except Exception:
@@ -6957,7 +6503,18 @@ class BasicVideoPlayer:
             shutil.copy2(self._spotrec_tmp_path, dest)
             src_json = self._recording_sidecar_path(Path(self._spotrec_tmp_path))
             if src_json.exists():
-                shutil.copy2(src_json, self._recording_sidecar_path(dest))
+                metadata = json.loads(src_json.read_text(encoding="utf-8"))
+                for section in ("actual", "fetch_frames_output"):
+                    diagnostic = metadata.get(section, {}).get("raw_peak")
+                    if diagnostic:
+                        source = src_json.parent / diagnostic["path"]
+                        copied = dest.parent / "diagnostics" / (dest.stem + "_raw_peak.npy")
+                        copied.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(source, copied)
+                        diagnostic["path"] = copied.relative_to(dest.parent).as_posix()
+                metadata["npy_file"] = dest.name
+                metadata["npy_path"] = str(dest)
+                self._write_json_atomic(self._recording_sidecar_path(dest), metadata)
             self._spotrec_status_var.set(f"Saved copy: {dest.name}")
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
@@ -8386,6 +7943,7 @@ class BasicVideoPlayer:
         self._show_st2_popup(self._s_map)
         self._update_spot_view()
         self._refresh_stationary_candidates(False)
+        self._refresh_spot_brightness()
 
     def _update_spot_view(self) -> None:
         if not self._spot_centers or self._s_map is None:
@@ -8972,7 +8530,43 @@ class BasicVideoPlayer:
         self._play_running = True
         self._spot_playback_tick()
 
+    def _accumulate_brightness(self, frame) -> None:
+        native = np.asarray(frame)
+        if native.ndim == 3:
+            native = native[..., 0]
+        if self._brightness_peak is None:
+            self._brightness_peak = native.copy()
+        else:
+            np.maximum(self._brightness_peak, native, out=self._brightness_peak)
+        self._brightness_frames += 1
+
+    def _refresh_spot_brightness(self) -> None:
+        peak = self._brightness_peak
+        for item in self._brightness_table.get_children():
+            self._brightness_table.delete(item)
+        if peak is None:
+            return
+        peak, scale, raw, source = brightness_source(
+            Path(self.video_path), getattr(self, "_source_recording_metadata", {}), peak, self._brightness_frames)
+        self._update_spot_bounds_intensity(peak.shape)
+        result = spot_brightness(peak, self._spot_bounds_int_all, scale)
+        clipping = str(result["clipped"]) if raw else "unknown (saved pixels only)"
+        self._brightness_summary_var.set(
+            f"{result['total']} detected spots, before motion/shape filters; {self._brightness_frames} frames. "
+            f"Brightest pixel in each {max(2, self._spot_window_size // 2 * 2)} px window.\n"
+            f"{source}. Near limit (≥250): {result['near']} including clipped. Sensor clipping: {clipping}.")
+        for i, count in enumerate(result["counts"]):
+            lo, hi = BRIGHTNESS_EDGES[i:i+2]
+            interval = f"{lo:g}–<{hi:g}" if i < 10 else "250–255 (inclusive)"
+            self._brightness_table.insert("", "end", values=(interval, count))
+
     def _show_finished(self, show: bool):
+        if show:
+            self._refresh_spot_brightness()
+        else:
+            self._brightness_summary_var.set("Load or capture frames to measure spot brightness.")
+            for item in self._brightness_table.get_children():
+                self._brightness_table.delete(item)
         if not show:
             self._analysis_finished = False
             if self._auto_inspect_chk is not None:
@@ -9157,6 +8751,8 @@ class BasicVideoPlayer:
         return True
 
     def _start_after_load(self, gray0: np.ndarray) -> None:
+        self._brightness_peak = None
+        self._brightness_frames = 0
         self._analysis_detection_mode = self._detection_mode_var.get()
         for widget in (self._ring_score_entry, self._motion_range_checkbox):
             widget.state(["disabled"] if self._analysis_detection_mode == "Intensity" else ["!disabled"])
@@ -9180,6 +8776,8 @@ class BasicVideoPlayer:
 
         self._source_shape = tuple(gray0.shape)
         self._cache_gray_frames = bool(self.source_kind == "avi")
+        if self.source_kind == "avi":
+            self._source_recording_metadata = {}
         self.current_idx = 0
         self.last_frame_gray = gray0
         self._overlay_base_frame = gray0.copy()
@@ -9266,6 +8864,7 @@ class BasicVideoPlayer:
                 if not ok or frame is None:
                     break
 
+                self._accumulate_brightness(frame)
                 gray = self._analysis_frame(frame)
                 if gray is None:
                     break
@@ -9304,6 +8903,7 @@ class BasicVideoPlayer:
                     if self.stop_event.is_set():
                         break
                     frame = self.npy_frames[i]
+                    self._accumulate_brightness(frame)
                     gray = self._analysis_frame(frame)
                     if gray is None:
                         break
@@ -9328,6 +8928,7 @@ class BasicVideoPlayer:
                             continue
             else:
                 if not self.stop_event.is_set():
+                    self._accumulate_brightness(self.npy_frames)
                     gray = self._analysis_frame(self.npy_frames)
                     if gray is not None:
                         gray = self._apply_flat_field(

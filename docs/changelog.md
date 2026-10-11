@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-10-11 Acquisition controls for the next lab session
+
+- Magnifier defaults on; shared exposure/gain remain 0.6 ms / 20. Live BG-on also
+  enables the shared capture-subtraction checkbox. Source name/hash is visible;
+  exact used backgrounds are retained per day.
+- One recording folder with dated defaults; shared filename labels and notes for
+  frames, backgrounds and spots. Fixed the frame helper ignoring its output path.
+  Removed the good/bad/pending tab without moving/deleting existing recordings.
+- Spot brightness counts use per-spot peak pixels across measurement frames,
+  fixed Mono12 scaling, 25-unit bins, near-limit and sensor-clipping counts.
+  Subtracted captures preserve raw peak projections so subtraction cannot hide
+  clipping. Legacy data explicitly report unavailable raw clipping evidence.
+- Fixed dim-frame display scaling, reduced background-projection memory use,
+  separated crowded control rows and clarified Save copy / Close recording.
+- Camera-free GUI and synthetic/fake-camera checks passed: 114 unittest checks
+  plus four metric checks. Updated stale defaults/layout and tuning fixtures;
+  interference tuning algorithms are unchanged. Hardware validation remains due.
+
 ## 2026-10-11 Background profile provenance (awaiting lab validation)
 
 - Active background selection now preserves the source filename and NPY SHA-256;

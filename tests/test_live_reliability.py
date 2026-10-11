@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 from polarcam import cli
 from polarcam.live import intensity_spots
+from polarcam.live.acquisition_helpers import save_raw_peak, brightness_source
 from polarcam.live.background_profiles import read_background_profile, save_active_background
 from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, compare_modulation, display_envelope, modulation_stats
 
@@ -157,11 +158,11 @@ class GuiStartupTests(unittest.TestCase):
                             player = live_gui.BasicVideoPlayer(root)
                             root.update_idletasks()
                             root.update()
-                            self.assertEqual(len(player._notebook.tabs()), 5)
+                            self.assertEqual(len(player._notebook.tabs()), 4)
                             self.assertFalse(player._live_running)
                             self.assertFalse(player._spotrec_running)
                             self.assertIsNone(player._live_controller)
-                            self.assertEqual(float(player._live_gain_var.get()), 1.0)
+                            self.assertEqual(float(player._live_gain_var.get()), 20.0)
                             for variable in (
                                 player._live_exp_ms_var,
                                 player._live_capture_exp_ms_var,
@@ -169,7 +170,7 @@ class GuiStartupTests(unittest.TestCase):
                                 player._spotrec_exp_ms_var,
                                 player._stationary_capture_max_exp_ms_var,
                             ):
-                                self.assertEqual(float(variable.get()), 1.2)
+                                self.assertEqual(float(variable.get()), 0.6)
                             for variable in (
                                 player._live_background_subtract_var,
                                 player._live_capture_background_subtract_var,
@@ -179,7 +180,8 @@ class GuiStartupTests(unittest.TestCase):
                             ):
                                 self.assertFalse(variable.get())
                             self.assertFalse(player._live_background_subtract_enabled)
-                            self.assertTrue((Path(directory) / "datasets").is_dir())
+                            self.assertTrue(player._session_dir().is_dir())
+                            self.assertTrue(player._live_mag_enabled_var.get())
                             self.assertEqual(callback_errors, [])
                             player.on_close()
                             self.assertIsNone(player._ui_pump_after_id)
@@ -609,6 +611,12 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertEqual(self.player._intensity_channels.shape, (5, 1, 4))
         np.testing.assert_array_equal(np.load(path), stack)
         self.assertEqual(self.controllers, [])
+        self.assertEqual(self.player._brightness_frames, 5)
+        np.testing.assert_array_equal(self.player._brightness_peak, stack.max(axis=0))
+        self.assertIn("Sensor clipping: 0", self.player._brightness_summary_var.get())
+        counts = [int(self.player._brightness_table.item(item, "values")[1])
+                  for item in self.player._brightness_table.get_children()]
+        self.assertEqual(sum(counts), 1)
         self.errors.assert_not_called()
 
     def test_intensity_distribution_export_keeps_acquisition_metadata(self):
@@ -753,6 +761,26 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertTrue(np.isfinite(result["directions"]).all())
         self.errors.assert_not_called()
 
+    def test_shared_capture_settings_labels_and_background_toggle(self):
+        self.player._live_exp_ms_var.set("0.8")
+        self.player._spotrec_gain_analog_var.set("12")
+        self.assertEqual(self.player._fetch_exp_ms_var.get(), "0.8")
+        self.assertEqual(self.player._live_capture_exp_ms_var.get(), "0.8")
+        self.assertEqual(self.player._live_gain_var.get(), "12")
+        self.player._filename_label_var.set("gold wide")
+        self.assertEqual(self.player._capture_conditions()["filename_label"], "gold_wide")
+        with patch.object(self.player, "_load_background_profile", return_value=np.zeros((8, 8))):
+            self.player._live_background_subtract_var.set(True)
+            self.player._on_live_background_toggle()
+        for variable in (self.player._fetch_background_subtract_var,
+                         self.player._spotrec_background_subtract_var,
+                         self.player._stationary_capture_background_subtract_var):
+            self.assertTrue(variable.get())
+        self.player._spotrec_background_subtract_var.set(False)
+        self.assertFalse(self.player._fetch_background_subtract_var.get())
+        self.assertTrue(self.player._live_background_subtract_var.get())
+        self.assertFalse((self.player._stationary_dataset_root_dir() / "pending").exists())
+
     def test_interference_unknown_is_not_inferred_from_sound_checkbox(self):
         self.player._sound_on_var.set(True)
         self.assertEqual(self.player._capture_conditions()["interference_drive"], "Unknown")
@@ -769,12 +797,36 @@ class IntensityLifecycleTests(unittest.TestCase):
                   "roi": {"OffsetX": 2, "OffsetY": 4}}
         self.player._interference_state_var.set("On")
         conditions = self.player._capture_conditions()
-        with patch.object(live_gui.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")):
+        with patch.object(live_gui.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")) as capture:
             self.player._capture_frames_to_npy(path, 2, 80, 1.2, 1, False, conditions=conditions)
+        command = capture.call_args.args[0]
+        self.assertEqual(command[command.index("--out-path") + 1], str(path))
         saved = json.loads(path.with_suffix(".json").read_text())
         self.assertEqual(saved["conditions"]["interference_drive"], "On")
         self.assertFalse(saved["background"]["background_subtracted"])
         self.assertEqual(saved["actual"]["frames"], 2)
+
+    def test_save_copy_keeps_raw_brightness_diagnostic(self):
+        source = Path.cwd() / "original.npy"
+        raw = np.array([[4095, 1000], [2000, 3000]], dtype=np.uint16)
+        saved = raw - 1000
+        np.save(source, saved[None])
+        diagnostic = save_raw_peak(source, raw, 1)
+        source.with_suffix(".json").write_text(json.dumps({
+            "background": {"background_subtracted": True},
+            "fetch_frames_output": {"raw_peak": diagnostic}}))
+        self.player._spotrec_tmp_path = source
+        dest = Path.cwd() / "copied" / "gold.npy"
+        dest.parent.mkdir()
+        with patch.object(live_gui.filedialog, "asksaveasfilename", return_value=str(dest)):
+            self.player._spotrec_save()
+        metadata = json.loads(dest.with_suffix(".json").read_text())
+        peak, _, reliable, _ = brightness_source(dest, metadata, saved, 1)
+        self.assertTrue(reliable)
+        np.testing.assert_array_equal(peak, raw)
+        self.assertEqual(metadata["npy_file"], "gold.npy")
+        self.assertTrue(source.exists())
+        self.errors.assert_not_called()
 
     def test_stop_button_closes_roi_camera_before_restarting_live(self):
         analyser = self.start_analyser()
@@ -785,7 +837,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertIsNot(live, analyser)
         self.assertEqual(self.events[-3:], [(0, "close"), (1, "open"), (1, "start")])
         live.full_sensor.assert_called_once()
-        live.set_timing.assert_called_once_with(10.0, 1.2)
+        live.set_timing.assert_called_once_with(10.0, 0.6)
         self.assertFalse(self.player._live_intensity_running)
         self.assertTrue(self.player._live_running)
         self.assertEqual(self.player._live_zoom_center, (32.0, 32.0))
@@ -803,6 +855,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.player._live_intensity_stop_btn.invoke()
         self.root.geometry("1600x1000")
         self.root.deiconify()
+        self.root.update()
         self.root.update_idletasks()
         self.root.withdraw()
         live = self.controllers[-1]
@@ -816,7 +869,8 @@ class IntensityLifecycleTests(unittest.TestCase):
             self.assertNotEqual(str(image), str(self.player._live_zoom_blank_ref))
             self.assertNotEqual(str(image), previous_image)
             previous_image = str(image)
-            self.assertEqual(self.player._live_mag_max_var.get(), f"Magnifier max pixel: {value >> 4}")
+            expected = round(value * 255 / 4095)
+            self.assertEqual(self.player._live_mag_max_var.get(), f"Magnifier max pixel: {expected}")
 
     def test_internal_stop_does_not_restart_camera(self):
         self.start_analyser()
@@ -944,19 +998,21 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.player._live_intensity_axis.lines), 1)
 
     def emit_tuning_trial(self, analyser, kind, amplitude, start):
-        self.player._intensity_tuning_duration_var.set("2")
+        self.player._intensity_tuning_duration_var.set("6")
         self.player._intensity_tuning_label_var.set(kind)
         self.player._intensity_tuning_confirm_var.set(True)
         with patch.object(live_gui.time, "perf_counter", return_value=start):
             analyser.cam.frame_timed.emit(np.full((14, 14), 1000, dtype=np.uint16), start)
             self.player._begin_intensity_trial(kind)
         self.assertIsNotNone(self.player._intensity_tuner.active)
-        for index in range(1600):
+        for index in range(4800):
             stamp = start + 0.5 + index / 800.0
             value = int(round(1000.0 + amplitude * np.sin(2.0 * np.pi * index / 200.0)))
             with patch.object(live_gui.time, "perf_counter", return_value=stamp):
-                analyser.cam.frame_timed.emit(np.full((14, 14), value, dtype=np.uint16), stamp)
-        with patch.object(live_gui.time, "perf_counter", return_value=start + 2.5):
+                modulation = amplitude / 1000 * np.sin(2 * np.pi * index / 200)
+                mosaic = value * np.array([[1.2 + modulation, 1.1], [0.9, 0.8 - modulation]])
+                analyser.cam.frame_timed.emit(np.tile(mosaic.astype(np.uint16), (7, 7)), stamp)
+        with patch.object(live_gui.time, "perf_counter", return_value=start + 6.5):
             self.player._update_intensity_tuning()
 
     def test_tuning_window_reports_target_and_exports_native_trials(self):
@@ -964,7 +1020,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.player._open_intensity_tuning()
         self.emit_tuning_trial(analyser, "reference", 200.0, 100.0)
         self.assertIsNotNone(self.player._intensity_tuner.reference)
-        self.emit_tuning_trial(analyser, "test", 10.0, 103.0)
+        self.emit_tuning_trial(analyser, "test", 10.0, 107.0)
         result = self.player._intensity_tuner.last
         self.assertTrue(result["comparison"]["target_reached"])
         self.assertIn("10x observed target", self.player._intensity_tuning_status_var.get())
@@ -974,14 +1030,14 @@ class IntensityLifecycleTests(unittest.TestCase):
             self.player._save_intensity_trials()
         payload = json.loads(path.read_text())
         self.assertEqual(len(payload["trials"]), 2)
-        self.assertEqual(len(payload["trials"][1]["intensity_dn"]), 1600)
-        self.assertEqual(payload["trials"][0]["context"]["exposure_us"], 1200.0)
+        self.assertEqual(len(payload["trials"][1]["intensity_dn"]), 4800)
+        self.assertEqual(payload["trials"][0]["context"]["exposure_us"], 600.0)
 
     def test_settings_change_invalidates_tuning_reference(self):
         analyser = self.start_analyser()
         self.emit_tuning_trial(analyser, "reference", 100.0, 100.0)
-        analyser.cam.timing.emit({"resulting_fps": 800.0, "exposure_us": 600.0})
-        with patch.object(live_gui.time, "perf_counter", return_value=102.5):
+        analyser.cam.timing.emit({"resulting_fps": 800.0, "exposure_us": 900.0})
+        with patch.object(live_gui.time, "perf_counter", return_value=106.5):
             self.player._update_intensity_tuning()
         self.assertIsNone(self.player._intensity_tuner.reference)
         self.assertIn("changed", self.player._intensity_tuning_status_var.get())
@@ -1163,6 +1219,7 @@ class BackgroundProfileProvenanceTests(unittest.TestCase):
         player = live_gui.BasicVideoPlayer.__new__(live_gui.BasicVideoPlayer)
         player._analysis_lock = threading.Lock()
         player._background_profile_storage_path = lambda: self.active
+        player._background_profiles_dir = lambda: Path(self.directory.name) / "backgrounds"
         player._find_background_profile_path = lambda base_dir=None: self.active
         for name, value in (("wide.npy", 32), ("narrow.npy", 5)):
             source = self.active.with_name(name)
@@ -1173,7 +1230,10 @@ class BackgroundProfileProvenanceTests(unittest.TestCase):
             self.assertEqual(metadata["background_profile_source_path"], str(source))
             self.assertEqual(metadata["background_profile_sha256"], hashlib.sha256(self.active.read_bytes()).hexdigest())
             args = player._background_capture_args()
-            self.assertEqual(args[args.index("--background-profile") + 1], str(self.active))
+            pinned = Path(args[args.index("--background-profile") + 1])
+            self.assertNotEqual(pinned, self.active)
+            self.assertEqual(pinned.read_bytes(), self.active.read_bytes())
+            self.assertEqual(read_background_profile(pinned)[1]["background_profile_source_path"], str(source))
             self.assertEqual(args[args.index("--background-profile-sha256") + 1], metadata["background_profile_sha256"])
             if name == "wide.npy":
                 first_hash = metadata["background_profile_sha256"]
@@ -1320,6 +1380,9 @@ class CaptureReliabilityTests(unittest.TestCase):
                 background_profile_sha256=expected["background_profile_sha256"],
             )
         np.testing.assert_array_equal(np.load(path)[:2, 0, 0], [968, 969])
+        raw_peak = np.load(path.parent / metadata["raw_peak"]["path"])
+        np.testing.assert_array_equal(raw_peak, np.full((8, 8), 1001, dtype=np.uint16))
+        self.assertEqual(metadata["raw_peak"]["frames"], 2)
         self.assertTrue(switched)
         self.assertTrue(metadata["background_subtracted"])
         self.assertEqual(metadata["background_profile_source_path"], str(source))

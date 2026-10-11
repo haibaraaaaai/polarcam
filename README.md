@@ -7,11 +7,10 @@ operation: opening the program, illumination, stage controls, interference tunin
 backgrounds, recording modes and saving measurements. It is an editable working
 manual based on Hugh Bowman's 9 September 2026 handover.
 
-**Current status:** the camera changes in `10cc419` were committed on 10 October
-without tests or camera execution, as requested. The manual marks their intended
-behaviour and carries the pending lab checklist. Documentation cleanup does not
-validate those changes. Older validation results in the archive apply to the
-versions and dates recorded there.
+**Current status:** camera-free GUI review and synthetic/fake-camera checks passed
+on 11 October 2026. Camera timing, gain readbacks, stage controls and recording
+transitions still need the lab check. The controls below supersede the older
+session/review descriptions in the working Word manual.
 
 ## Install and launch
 
@@ -64,9 +63,42 @@ relative to the current working directory. File dialogs can select other locatio
 | `.venv/` | This machine's installed Python environment | Ignore |
 
 Data layout is described in [data/README.md](data/README.md), and analysis
-versioning in [analysis/README.md](analysis/README.md). A new camera session is
-intended to save under `data/<experiment>/polarcam/<session>/`; active background
-profiles remain under `data/backgrounds/`.
+versioning in [analysis/README.md](analysis/README.md). Recordings default to
+`data/<experiment>/polarcam/YYYY-MM-DD/`, with `frames/`, `backgrounds/`, `spots/`
+and `stationary/` underneath. **Recording folder** changes this parent for every
+capture type. Existing data are not moved.
+
+## Recording controls
+
+- Exposure starts at **0.6 ms**, analogue gain at **20**, and magnifier is on.
+  Exposure/gain fields share values across tabs. Use **Apply** to update a running
+  live feed; new captures use the current values. Display stretch is separate.
+- Enter a **Filename label** such as `hinge_widefield` before capture. Frame stacks,
+  backgrounds and spot captures append it to their timestamps; notes are saved
+  in JSON. Filenames remain unique. Spot recordings save automatically; **Save
+  copy** makes another copy, and **Close recording** only closes the loaded result.
+- Select/capture the appropriate background. Its source name and short hash are
+  shown. Enabling live subtraction also enables the shared **Save with background
+  subtraction** setting. Saving can still be switched off independently. Turning
+  live subtraction off does not silently change the save choice. Used profiles
+  are preserved in `backgrounds/used/`, and capture JSON records the exact hash.
+- Spot analysis counts all detected candidates before motion/shape filtering.
+  Each spot contributes its brightest pixel over the measured frames and current
+  extraction window. The fixed 0–255 scale maps Mono12 0–4095; it ignores display
+  stretch. **250+** means near full scale (~4015 raw); **clipped** means 4095.
+  Counts appear in 25-unit bins, with a final 250–255 bin. Counts depend on detection;
+  for static rods choose **Intensity**. Overlapping windows/hot pixels can affect
+  the counts, so inspect the image too.
+- BG-subtracted captures keep one raw maximum-projection image in a `diagnostics/`
+  subfolder, referenced and hash-checked through their JSON. Keep it with the
+  recording to recover accurate per-spot clipping counts. Legacy subtracted files
+  without this diagnostic show saved-pixel counts and mark sensor clipping unknown.
+- The good/bad/pending review tab and automatic review labels have been removed.
+  Old recording folders are retained.
+
+Before the next measurement, check actual exposure/gain readbacks, switch wide/narrow
+backgrounds, and make one labelled frame stack and spot recording. Verify their
+folder, JSON background identity, and brightness counts against the live image.
 
 To copy a later dataset while retaining the source and verifying SHA-256 hashes:
 
@@ -116,7 +148,7 @@ different density conventions; consult the manual and each analysis's methods.
 ## Development and validation
 
 `tests/` checks program behaviour; it is separate from experimental analysis.
-When testing is resumed, both commands are needed for the current suite:
+Both commands are needed for the current suite:
 
 ```powershell
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
@@ -124,19 +156,10 @@ When testing is resumed, both commands are needed for the current suite:
 ```
 
 The second file contains standalone functions that `unittest` discovery does not
-run. No tests were executed for the 10 October camera changes or this cleanup.
-Some older tests still expect the old launch directory and 1.2 ms / gain 1
-defaults; review those expectations with the intended behaviour before running
-the suite. Synthetic checks do not establish actual FPS, lost-frame behaviour,
-stage response or experimental accuracy.
-
-The next hardware pass is listed in the user manual. Existing deferred findings
-about calibration/model selection, legacy azimuth unwrapping, sphere-axis fitting,
-native versus preview intensity scaling and saturation handling are preserved in
-[historical rewrite notes](docs/archive/REWRITE_NOTES.md#other-deferred-findings).
-Their present status has not been re-audited here. The planned repeating spot
-cycler is not implemented; reliable camera transitions and recording integrity
-remain the development priority.
+run. The 11 October camera-free pass covered 114 unittest checks and four metric
+checks. Synthetic checks do not establish actual FPS, lost-frame behaviour, stage
+response or experimental accuracy. Remaining historical findings are recorded in
+[the rewrite notes](docs/archive/REWRITE_NOTES.md#other-deferred-findings).
 
 ## Provenance and history
 

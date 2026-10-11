@@ -11,6 +11,7 @@ from PySide6.QtWidgets import QApplication
 
 from Controlling.controller.controller import Controller
 from polarcam.live.background_profiles import read_background_profile
+from polarcam.live.acquisition_helpers import save_raw_peak
 
 
 log = logging.getLogger(__name__)
@@ -181,6 +182,7 @@ def fetch_frames(
     controller = Controller()
 
     collected: list[np.ndarray] = []
+    raw_peak = None
     done = False
     actual_fps: float | None = None
     actual_roi: dict | None = None
@@ -257,6 +259,7 @@ def fetch_frames(
 
     def _on_frame(arr_obj: object) -> None:
         nonlocal done, first_frame_seen, max_raw_value, dropped_first_frame, last_frame_at
+        nonlocal raw_peak
         if done:
             return
         try:
@@ -271,6 +274,13 @@ def fetch_frames(
                 max_raw_value = cur_max if max_raw_value is None else max(max_raw_value, cur_max)
             except Exception:
                 pass
+            # Match exactly the measurement frames that will be saved, excluding
+            # the warm-up frame and synthetic phase marker.
+            if background_profile is not None and len(collected) < n_frames:
+                if raw_peak is None:
+                    raw_peak = frame_native.copy()
+                else:
+                    np.maximum(raw_peak, frame_native, out=raw_peak)
             frame_native = _subtract_background(
                 frame_native,
                 profile=background_profile,
@@ -460,11 +470,13 @@ def fetch_frames(
     if marker is not None and stack.ndim == 3:
         stack = np.concatenate([stack, marker[np.newaxis, ...]], axis=0)
     np.save(out_path, stack)
+    raw_peak_info = save_raw_peak(out_path, raw_peak, frame_count_saved) if raw_peak is not None else None
     return out_path, actual_fps, int(frame_count_saved), {
         "roi": actual_roi,
         "timing": actual_timing,
         "gains": actual_gains,
         "max_raw_value": max_raw_value,
+        "raw_peak": raw_peak_info,
         "max_saved_value": (int(np.max(stack)) if stack.size else None),
         "phase_marker_appended": bool(marker is not None),
         **background_metadata,
@@ -522,6 +534,7 @@ def main() -> None:
             "timing": (actual_info or {}).get("timing"),
             "gains": (actual_info or {}).get("gains"),
             "max_raw_value": (actual_info or {}).get("max_raw_value"),
+            "raw_peak": (actual_info or {}).get("raw_peak"),
             "max_saved_value": (actual_info or {}).get("max_saved_value"),
             "phase_marker_appended": (actual_info or {}).get("phase_marker_appended"),
             "background_profile_path": (actual_info or {}).get("background_profile_path"),

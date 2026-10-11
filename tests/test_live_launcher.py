@@ -46,7 +46,7 @@ class LiveLauncherTests(unittest.TestCase):
             launch.return_value.returncode = 7
             result = cli.main([])
 
-        self.assertEqual(launch.call_args.kwargs["cwd"], Path.cwd().resolve())
+        self.assertEqual(launch.call_args.kwargs["cwd"], (Path.cwd() / "data").resolve())
         self.assertEqual(result, 7)
 
     def test_module_entry_point_propagates_exit_status(self):
