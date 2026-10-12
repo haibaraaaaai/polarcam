@@ -2,6 +2,7 @@ from pathlib import Path
 import hashlib
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,6 +12,23 @@ from polarcam.live.acquisition_helpers import (
 
 
 class AcquisitionHelpersTests(unittest.TestCase):
+    def test_uint16_preview_matches_previous_conversion_for_every_input(self):
+        frame = np.arange(65536, dtype=np.uint16).reshape(256, 256)
+        original = frame.copy()
+        expected = np.rint(np.clip(frame.astype(np.float32), 0, 4095) * (255 / 4095)).astype(np.uint8)
+        with patch.object(np, 'nan_to_num', side_effect=AssertionError('Float conversion used for camera pixels')):
+            actual = preview_u8(frame)
+            np.testing.assert_array_equal(actual, expected)
+            np.testing.assert_array_equal(preview_u8(frame[::2, ::3]), expected[::2, ::3])
+        np.testing.assert_array_equal(frame, original)
+        self.assertFalse(np.shares_memory(actual, frame))
+
+    def test_float_preview_still_sanitizes_invalid_values(self):
+        frame = np.array([[np.nan, np.inf, -np.inf, -1, 0, 4095, 65535]], dtype=np.float32)
+        original = frame.copy()
+        np.testing.assert_array_equal(preview_u8(frame), [[0, 255, 0, 0, 0, 255, 255]])
+        np.testing.assert_array_equal(frame, original)
+
     def test_verified_background_is_added_back_with_sensor_roi_offset(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'spot.npy'

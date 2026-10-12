@@ -1037,12 +1037,14 @@ class BasicVideoPlayer:
         )
         if bg is None:
             return np.array(arr, copy=True)
+        if arr.dtype in (np.dtype(np.uint8), np.dtype(np.uint16)):
+            work = np.subtract(arr, bg, dtype=np.result_type(np.float32, bg.dtype))
+            np.maximum(work, 0.0, out=work)
+            np.rint(work, out=work)
+            np.clip(work, 0.0, float(np.iinfo(arr.dtype).max), out=work)
+            return work.astype(arr.dtype)
         work = arr.astype(np.float32, copy=False) - bg
         np.maximum(work, 0.0, out=work)
-        if arr.dtype == np.uint8:
-            return np.asarray(np.clip(np.rint(work), 0.0, 255.0), dtype=np.uint8)
-        if arr.dtype == np.uint16:
-            return np.asarray(np.clip(np.rint(work), 0.0, 65535.0), dtype=np.uint16)
         if np.issubdtype(arr.dtype, np.integer):
             info = np.iinfo(arr.dtype)
             return np.asarray(np.clip(np.rint(work), float(info.min), float(info.max)), dtype=arr.dtype)
@@ -4258,21 +4260,17 @@ class BasicVideoPlayer:
             return
         try:
             frame16 = np.asarray(arr_obj, dtype=np.uint16, copy=False)
-            if bool(getattr(self, "_live_background_subtract_enabled", False)):
-                frame16 = self._subtract_background_frame(frame16, roi=None, base_dir=Path.cwd())
-            frame8 = preview_u8(frame16)
         except Exception:
             return
-        self._live_last_frame = frame8
         try:
-            self._live_queue.put_nowait(frame8)
+            self._live_queue.put_nowait(frame16)
         except queue.Full:
             try:
                 self._live_queue.get_nowait()
             except queue.Empty:
                 return
             try:
-                self._live_queue.put_nowait(frame8)
+                self._live_queue.put_nowait(frame16)
             except queue.Full:
                 pass
 
@@ -5727,9 +5725,13 @@ class BasicVideoPlayer:
         if frame is not None and self._live_img_label is not None:
             self._live_status_var.set("Live frames received (10 fps requested)")
             try:
+                if bool(getattr(self, "_live_background_subtract_enabled", False)):
+                    frame = self._subtract_background_frame(frame, roi=None, base_dir=Path.cwd())
+                frame = preview_u8(frame)
+                self._live_last_frame = frame
                 self._update_live_tracking(frame)
                 frame_display = self._apply_live_display_stretch(frame)
-                frame_mean = float(np.mean(frame.astype(np.float64, copy=False))) if frame.size else float("nan")
+                frame_mean = float(np.mean(frame, dtype=np.float64)) if frame.size else float("nan")
                 if np.isfinite(frame_mean):
                     self._live_hist_mean_var.set(f"Image-wide mean: {frame_mean:.2f} (8-bit)")
                 else:

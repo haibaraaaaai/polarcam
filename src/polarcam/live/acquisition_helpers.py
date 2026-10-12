@@ -11,6 +11,11 @@ import numpy as np
 
 CAMERA_FULL_SCALE = 4095
 BRIGHTNESS_EDGES = np.array([*range(0, 251, 25), 255], dtype=float)
+_UINT16_PREVIEW_LUT = np.rint(
+    np.clip(np.arange(65536, dtype=np.float32), 0, CAMERA_FULL_SCALE)
+    * (255 / CAMERA_FULL_SCALE)
+).astype(np.uint8)
+_UINT16_PREVIEW_LUT.setflags(write=False)
 
 
 def filename_label(value: str) -> str:
@@ -42,6 +47,8 @@ def preview_u8(frame: np.ndarray) -> np.ndarray:
         raise ValueError("Expected a grayscale frame")
     if arr.dtype == np.uint8:
         return np.ascontiguousarray(arr)
+    if arr.dtype == np.uint16:
+        return _UINT16_PREVIEW_LUT[arr]
     work = np.nan_to_num(arr.astype(np.float32), nan=0, posinf=CAMERA_FULL_SCALE, neginf=0)
     return np.rint(np.clip(work, 0, CAMERA_FULL_SCALE) * (255 / CAMERA_FULL_SCALE)).astype(np.uint8)
 

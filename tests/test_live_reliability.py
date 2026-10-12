@@ -937,6 +937,42 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertEqual(live.cam.error.callbacks, [])
         live.close.assert_called_once()
 
+    def test_live_preview_discards_stale_frames_before_background_processing(self):
+        self.player._start_live_feed()
+        self.player._live_background_subtract_enabled = True
+        frames = [np.full((64, 64), value, dtype=np.uint16) for value in range(1024, 1184, 16)]
+        original = frames[-1].copy()
+        with patch.object(self.player, "_subtract_background_frame", side_effect=lambda frame, **kwargs: frame - 16) as subtract:
+            for frame in frames:
+                self.controllers[-1].cam.frame.emit(frame)
+            subtract.assert_not_called()
+            self.assertLessEqual(self.player._live_queue.qsize(), 2)
+            with patch.object(self.root, "after", return_value=None):
+                self.player._live_tick()
+            subtract.assert_called_once()
+            self.assertIs(subtract.call_args.args[0], frames[-1])
+        np.testing.assert_array_equal(self.player._live_last_frame, live_gui.preview_u8(original - 16))
+        np.testing.assert_array_equal(frames[-1], original)
+        self.assertTrue(self.player._live_queue.empty())
+
+    def test_background_subtraction_preserves_rounding_clipping_and_inputs(self):
+        for dtype in (np.uint8, np.uint16, np.int16, np.float32):
+            for background_dtype in (np.float32, np.float64):
+                with self.subTest(dtype=dtype, background_dtype=background_dtype):
+                    frame = np.array([[0, 10, 20], [100, 120, 200]], dtype=dtype)
+                    background = np.array([[.5, 1.5, 30], [10.5, -100000, .5]], dtype=background_dtype)
+                    original_frame = frame.copy()
+                    original_background = background.copy()
+                    expected = frame.astype(np.float32) - background
+                    np.maximum(expected, 0, out=expected)
+                    if np.issubdtype(dtype, np.integer):
+                        info = np.iinfo(dtype)
+                        expected = np.clip(np.rint(expected), float(info.min), float(info.max)).astype(dtype)
+                    actual = self.player._subtract_background_frame(frame, profile=background)
+                    np.testing.assert_array_equal(actual, expected)
+                    np.testing.assert_array_equal(frame, original_frame)
+                    np.testing.assert_array_equal(background, original_background)
+
     def test_returned_live_frames_update_the_magnifier(self):
         self.start_analyser()
         self.player._live_intensity_stop_btn.invoke()

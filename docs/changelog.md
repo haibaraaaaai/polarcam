@@ -2,6 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-10-12 Live-preview lag mitigation
+
+- Investigated lag after frame stacks and a background capture. Compared with
+  the user's last-tested 5830859, commit 6d07a08 introduced the fixed-scale
+  `preview_u8` conversion, adding several whole-image float passes to live preview.
+  Background subtraction and tracking already existed; their cost alone was not
+  evidence of a new regression. No hardware reproduction was performed.
+- Added a 64 KiB uint16 preview lookup table that exactly preserves the newer
+  0-4095 to 0-255 rounded/clipped mapping, including every uint16 input value.
+  Float/nonfinite inputs retain the existing fallback; no frame-dependent stretch.
+- Live preview now queues native frames cheaply and corrects/converts only the
+  newest frame consumed by a display tick. Stale previews are discarded before
+  expensive processing. Acquisition saving and diagnostic sampling are unchanged.
+- Reduced allocation during uint8/uint16 background subtraction, preserving
+  rounding/clipping and input ownership; eliminated the full-frame float64 copy
+  previously made just to compute the displayed mean. Tracking is unchanged.
+- Synthetic 2056x2464 benchmark (10 alternating iterations after warmup): preview
+  median 40.23 -> 10.59 ms; correction plus preview 65.90 -> 27.69 ms, exact outputs.
+  These exclude drawing, SDK and actual capture transitions; not hardware FPS claims.
+  Earlier burst check reduced ten stale-frame callbacks to about 0.2 ms before
+  one selected-frame render, rather than correcting every stale image.
+- Nine acquisition-helper tests and eleven focused background/live-preview tests
+  pass. Exhaustive uint16 mapping, fractional backgrounds, clipping, non-mutation
+  and burst handling are covered. After restoring the latest GUI/tests and
+  reapplying the performance changes, all 136 tests pass. The earlier two tuning
+  failures were confined to the older local versions. Existing editor diagnostics
+  on legacy imports and the Figure annotation are outside these changes.
+- Repository state matters: HEAD was b3ae058, but the GUI/test files were already
+  locally modified back to the 5830859 versions before this investigation; the
+  cause is unknown. With the user's approval, backed up both files under the
+  Windows TEMP folder `polarcam-recovery-20261012-181707`, verified matching SHA-256
+  hashes, and restored only those two working-tree files from b3ae058. Reapplied
+  the bounded-preview and allocation changes onto the restored latest code.
+  New controls, background provenance, camera-error reporting and shared optical
+  inversion are retained. Other edits, recordings, index and branch were untouched;
+  no commit was made. The restored baseline passed 134 tests before the two new
+  GUI regression tests were reapplied; the final suite passes all 136.
+- Lab retest: safely stop/relaunch, repeat two frame stacks and a background
+  capture, then check live preview with subtraction off/on. If lag persists, note
+  whether it is low display FPS or a growing delay behind real motion. Native
+  event delivery, drawing/tracking and memory pressure remain possible costs;
+  this change does not claim every cause of capture-related lag is resolved.
+
 ## 2026-10-12 Live traces and acquisition defaults
 
 - Replaced inherited live-GUI theta coefficients with a derived Fresnel/BFP

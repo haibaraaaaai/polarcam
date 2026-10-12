@@ -97,6 +97,10 @@ capture type. Existing data are not moved.
   ambiguous backgrounds leave sensor clipping unknown.
 - The live **Time trace** selector offers intensity, X, Y, or **X + Y anisotropy**
   together. Display reduction preserves extrema; measurements retain native samples.
+- Live full-frame preview discards stale queued images before background correction
+  and uses a fixed-scale lookup for camera pixels. This reduces catch-up lag without
+  dropping frames from saved recordings or intensity diagnostics. Restart after
+  updating, then retest capture-to-live transitions on the camera.
 - For frame-stack populations, choose **Intensity** detection, then **Theta /
   projection**. The theta tab shows 5° counts and spherical-area-corrected density;
   the sphere/projection tab is retained. **Frames / average = All** gives one mean
