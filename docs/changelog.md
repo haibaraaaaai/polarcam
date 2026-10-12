@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2026-10-12 Live traces and acquisition defaults
+
+- Replaced inherited live-GUI theta coefficients with a derived Fresnel/BFP
+  circular-annulus model (NA 0.39–1.30), shared through `polarcam.optics`.
+  Water r_max is 0.927683; scalar readouts and population reconstruction now
+  invert analytically and reject above-range radii. Exports identify the model.
+- Documented camera versus APD correction, Hugh's already-inverted matrix,
+  residual gain checks and the separate APD rig's reported 0.38 hole.
+- Added a theta histogram beside the existing intensity orientation projections,
+  including spherical-area density, per-rod/window counts and export. Clipped
+  extraction windows are excluded in full; unknown raw clipping is labelled.
+- Changed the shared camera exposure and standalone live spot counter default
+  to 1.2 ms. Check actual exposure readback when matching the stage period.
+- Added simultaneous live X/Y time traces. Removed the experimental fixed-Z
+  interference spectrum panel: quiet traces cannot establish optical cancellation.
+  Existing recordings and offline analyses are retained.
+- Brightness diagnostics can add back an exactly identified integer background
+  when a raw peak companion is unavailable; unverified profiles remain unknown.
+- Clarified SI doubled-amplitude versus full-cycle timing and the limits of
+  fixed-Z spectra. Hardware timing and optical cancellation still need lab checks.
+- Fixed the legacy spot-recording MSD diagnostic to unwrap rod azimuth with a
+  180-degree period, avoiding false jumps across the +/-90-degree boundary.
+- Final camera-free validation passed: 132 unittest checks, four standalone
+  interference-metric checks and CLI startup. Hardware verification remains due.
+
 ## 2026-10-11 Acquisition controls for the next lab session
 
 - Magnifier defaults on; shared exposure/gain remain 0.6 ms / 20. Live BG-on also

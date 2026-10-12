@@ -57,12 +57,13 @@ def save_raw_peak(path: Path, peak: np.ndarray, frames: int) -> dict:
 
 
 def brightness_source(path: Path, metadata: dict | list[dict], saved_peak: np.ndarray, frames: int):
-    """Prefer validated raw diagnostics; never infer sensor clipping from subtracted data."""
+    """Prefer raw diagnostics, otherwise add back an exactly identified background."""
     if isinstance(metadata, list):
         # The directly adjacent sidecar precedes legacy *_meta.json/parent metadata.
         metadata = next((item for item in metadata if isinstance(item, dict)), {})
     output = metadata.get("fetch_frames_output", {})
     diagnostic = output.get("raw_peak") or metadata.get("actual", {}).get("raw_peak")
+    diagnostic_issue = False
     if diagnostic:
         try:
             candidate = path.parent / diagnostic["path"]
@@ -75,14 +76,63 @@ def brightness_source(path: Path, metadata: dict | list[dict], saved_peak: np.nd
                 raise ValueError("nonfinite pixels")
             return peak, float(diagnostic["full_scale"]), True, "Raw camera pixels"
         except (OSError, ValueError, KeyError, TypeError):
-            return saved_peak, 255 if saved_peak.dtype == np.uint8 else CAMERA_FULL_SCALE, False, "Raw diagnostic missing/invalid; saved pixels only"
+            diagnostic_issue = True
     bg = metadata.get("background", {})
     subtracted = bg.get("background_subtracted", output.get("background_subtracted"))
     full_scale = 255 if saved_peak.dtype == np.uint8 else CAMERA_FULL_SCALE
     if subtracted is False and saved_peak.dtype != np.uint8:
         return saved_peak, full_scale, True, "Raw camera pixels"
-    reason = "BG-subtracted" if subtracted else "Raw provenance unavailable"
+    if subtracted is True and saved_peak.dtype != np.uint8:
+        recovered = _restore_peak_background(path, metadata, saved_peak)
+        if recovered is not None:
+            return recovered, full_scale, True, "Exact BG added back for clipping check; zero-clipped pixels are upper bounds"
+    reason = "Raw diagnostic missing/invalid" if diagnostic_issue else "BG-subtracted" if subtracted else "Raw provenance unavailable"
     return saved_peak, full_scale, False, f"{reason}; saved pixels only"
+
+
+def _restore_peak_background(path: Path, metadata: dict, saved_peak: np.ndarray):
+    """Invert integer-profile subtraction for bright pixels; never guess a legacy BG.
+
+    Positive saved peaks recover exactly. A zero peak only bounds the original
+    by the BG value; accept that bound only when it cannot hide saturation.
+    Fractional profiles have rounding ambiguity and need the raw diagnostic.
+    """
+    bg = metadata.get("background", {})
+    output = metadata.get("fetch_frames_output", {})
+    digest = bg.get("background_profile_sha256") or output.get("background_profile_sha256")
+    if not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+        return None
+    source = bg.get("background_profile_path") or output.get("background_profile_path")
+    candidates = [Path(source)] if source else []
+    for parent in (path.parent, *list(path.parents[1:4])):
+        candidates.append(parent / "backgrounds" / "used" / (digest + ".npy"))
+    for candidate in candidates:
+        try:
+            payload = candidate.read_bytes()
+            if hashlib.sha256(payload).hexdigest().lower() != digest.lower():
+                continue
+            import io
+            profile = np.asarray(np.load(io.BytesIO(payload), allow_pickle=False), dtype=float)
+            if profile.ndim != 2 or not np.isfinite(profile).all() or (profile < 0).any():
+                continue
+            if profile.shape != saved_peak.shape:
+                roi = metadata.get("roi") or output.get("roi") or {}
+                x, y = int(roi.get("OffsetX", roi.get("x", -1))), int(roi.get("OffsetY", roi.get("y", -1)))
+                if min(x, y) < 0:
+                    continue
+                h, w = saved_peak.shape
+                profile = profile[y:y+h, x:x+w]
+            if profile.shape != saved_peak.shape or not np.array_equal(profile, np.rint(profile)):
+                continue
+            restored = np.asarray(saved_peak, dtype=float) + profile
+            if ((saved_peak == 0) & (profile >= CAMERA_FULL_SCALE - 1)).any():
+                continue
+            if not np.isfinite(restored).all() or (restored > CAMERA_FULL_SCALE).any():
+                continue
+            return restored
+        except (OSError, ValueError, TypeError):
+            continue
+    return None
 
 
 def spot_brightness(peak: np.ndarray, bounds, full_scale=CAMERA_FULL_SCALE) -> dict:

@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from polarcam.optics import theta_from_radius
+
 
 AVERAGING_METHODS = ("3D Cartesian", "Anisotropy X/Y", "Four intensities")
 
@@ -42,7 +44,11 @@ def unit_vectors(xy, theta_lut, continuous=False):
     result = np.full((len(values), 3), np.nan)
     if not valid.any():
         return result
-    theta = np.interp(radius[valid], theta_lut["r"], theta_lut["theta_rad"])
+    if all(key in theta_lut for key in ("A", "B", "C")):
+        theta = theta_from_radius(radius[valid], theta_lut["A"], theta_lut["B"], theta_lut["C"])
+    else:
+        # Compatibility for explicitly supplied historical analysis/test LUTs.
+        theta = np.interp(radius[valid], theta_lut["r"], theta_lut["theta_rad"])
     doubled_phi = np.arctan2(values[valid, 1], values[valid, 0])
     phi = np.unwrap(doubled_phi) / 2 if continuous else np.mod(doubled_phi / 2, np.pi)
     result[valid] = np.column_stack((np.sin(theta)*np.cos(phi), np.sin(theta)*np.sin(phi), np.cos(theta)))
@@ -106,3 +112,24 @@ def projected_density(projected, bins=64):
     area = np.diff(x_edges)[:, None] * np.diff(y_edges)[None, :]
     density = counts / (len(points) * area) if len(points) else counts
     return density, x_edges, y_edges
+
+
+def theta_distribution(directions):
+    """Bin the displayed mean orientations, retaining rod/window indexing.
+
+    The solid-angle density integrates over the displayed phi range [0, pi).
+    It corrects spherical geometry only, not detection or brightness bias.
+    """
+    vectors = np.asarray(directions, dtype=np.float64)
+    if vectors.ndim != 3 or vectors.shape[-1] != 3:
+        raise ValueError("Expected window/spot/xyz directions.")
+    length = np.linalg.norm(vectors, axis=-1)
+    valid = np.isfinite(vectors).all(axis=-1) & (length > 0) & (vectors[..., 2] >= 0)
+    theta = np.full(length.shape, np.nan)
+    theta[valid] = np.degrees(np.arccos(np.clip(vectors[..., 2][valid] / length[valid], 0, 1)))
+    edges = np.arange(0., 95., 5.)
+    counts, _ = np.histogram(theta[valid], edges)
+    solid_angle = np.pi * (np.cos(np.radians(edges[:-1])) - np.cos(np.radians(edges[1:])))
+    density = counts / (counts.sum() * solid_angle) if counts.sum() else np.zeros_like(solid_angle)
+    return {"theta_deg": theta, "theta_bin_edges_deg": edges, "theta_counts": counts,
+            "theta_solid_angle_sr": solid_angle, "theta_density_per_sr": density}

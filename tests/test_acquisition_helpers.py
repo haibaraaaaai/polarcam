@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import tempfile
 import unittest
 
@@ -10,6 +11,34 @@ from polarcam.live.acquisition_helpers import (
 
 
 class AcquisitionHelpersTests(unittest.TestCase):
+    def test_verified_background_is_added_back_with_sensor_roi_offset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'spot.npy'
+            bgpath = path.parent / 'background.npy'
+            bg = np.full((6,8),200,dtype=np.float32)
+            bg[2:4,4:6] = [[120,200],[300,400]]
+            np.save(bgpath,bg)
+            metadata = {'background':{'background_subtracted':True,
+                'background_profile_path':str(bgpath),
+                'background_profile_sha256':hashlib.sha256(bgpath.read_bytes()).hexdigest()},
+                'roi':{'x':4,'y':2}}
+            saved=np.array([[3975,3800],[0,100]],np.uint16)
+            peak,scale,reliable,source=brightness_source(path,metadata,saved,150)
+            self.assertTrue(reliable)
+            np.testing.assert_array_equal(peak,[[4095,4000],[300,500]])
+            self.assertEqual(spot_brightness(peak,[(0,2,0,2)],scale)['clipped'],1)
+            np.save(bgpath,np.zeros_like(bg))
+            self.assertFalse(brightness_source(path,metadata,saved,150)[2])
+
+    def test_unknown_background_and_zero_clipping_cannot_prove_raw_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'stack.npy';bgpath=path.parent/'bg.npy'
+            for value in (4095.,12.5):
+                np.save(bgpath,np.full((2,2),value))
+                metadata={'background':{'background_subtracted':True,'background_profile_path':str(bgpath),
+                    'background_profile_sha256':hashlib.sha256(bgpath.read_bytes()).hexdigest()}}
+                self.assertFalse(brightness_source(path,metadata,np.zeros((2,2),np.uint16),150)[2])
+
     def test_dim_mono12_does_not_turn_into_bright_eight_bit_image(self):
         low = np.array([[0, 16, 255, 256, 4095]], dtype=np.uint16)
         np.testing.assert_array_equal(preview_u8(low), [[0, 1, 16, 16, 255]])

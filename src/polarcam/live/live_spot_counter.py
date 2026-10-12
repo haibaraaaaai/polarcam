@@ -32,7 +32,7 @@ class LiveSpotCounterApp:
         self._overlay_centers: list[tuple[float, float]] = []
         self._overlay_until = 0.0
 
-        self._exp_ms_var = tk.StringVar(value="0.6")
+        self._exp_ms_var = tk.StringVar(value="1.2")
         self._gain_var = tk.StringVar(value="20")
         self._thr_var = tk.StringVar(value="180")
         self._min_area_var = tk.StringVar(value="6")

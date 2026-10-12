@@ -1,14 +1,40 @@
 # Interference tuning: physics, metrics, and workflow
 
+## 12 October update: use live traces for manual checks
+
+The experimental fixed-Z spectrum panel has been removed from the GUI. It could
+measure temporal fluctuations, but could not establish interference cancellation:
+a constant interference bias can produce a quiet spectrum. Existing recordings
+and offline analyses are retained. Use live intensity and X/Y traces on an
+immobilized rod while varying mean Z slightly to inspect residual fringes.
+
+The SI outline describes an approximately 830 Hz triangle drive with doubled
+**excursion amplitude**, not doubled frequency, for 0.6 ms exposures. Hugh's
+handover recommends one full drive cycle per exposure (~1.2 ms) and explicitly
+reports weaker suppression at 0.6 ms. The manuscript contains both descriptions.
+Full-cycle integration of an ideal triangle sweep through an integer number of
+fringes removes the interference term. Half-cycle exposures crossing a turning
+point need not sample phase uniformly: doubling excursion alone does not ensure
+zero interference for every camera start time. A real resonant stage may also
+depart from the generator's triangle waveform.
+
+Use several mean Z positions for a stronger calibration. The older manual-sweep
+method below is retained as historical context, not exposed as a GUI check; its
+reduction number is not proof of optical cancellation or immunity to focus and
+background changes.
+
+Background add-back for saturation checks restores the static intensity term;
+it neither removes the coherent interference cross term nor repairs sensor clipping.
+
 This is the technical reference for the interference metric. For the physical
 stage setup and daily operating sequence, use the root
 [Polarcam User Manual](../Polarcam%20User%20Manual.docx). The metric's synthetic
 checks do not validate suppression on the lab stage. The 10 October camera
-control changes are still awaiting software and lab validation.
+control changes have software checks, but are still awaiting lab validation.
 
 This document explains the interference-cancellation step of the APD/Polarcam
 nanorod system, why the original span-only tuning number misleads, and how to
-use the upgraded Interference tuning panel and the offline analyser.
+interpret the historical sweep-based tuning panel and offline analyser.
 
 ---
 
@@ -23,21 +49,23 @@ The per-channel measured intensity is
 with delta the rod-versus-background optical phase difference. Vibrating the
 stage Z with a triangle wave at the stage resonance f0 (~830 Hz) while setting
 the camera exposure to one drive cycle (1/f0) turns every recorded frame into
-a cycle average. For a triangle sweep covering a total interference phase
-phi0 per cycle, the cycle average of the interference term is
+a cycle average. For an ideal triangle sweep with peak-to-peak interference
+phase excursion phi0, the cycle average of the interference term is
 
     2 sqrt(I_rod,j b_j) * sinc(phi0 / 2) * cos(delta_centre),   sinc(x) = sin(x)/x
 
 so:
 
 - sweep **less than one fringe** (peak-to-peak Z excursion below
-  lambda / 2n ≈ 240 nm for the He-Ne line in water): sinc > 0, signal sits
-  **above** the fringe mid-level;
+  lambda / 2n ≈ 240 nm for the He-Ne line in water): a residual remains;
+  whether the signal is above or below its interference-free value depends
+  on the mean optical phase;
 - sweep **exactly one fringe** (phi0 = 2 pi): sinc(π) = 0 — the interference
   term vanishes **for any** delta_centre. This is the null. At the null the
   static Z position stops mattering;
-- sweep **past one fringe**: sinc < 0 — the signal sits **below** mid. If your
-  signal "always dips below mid", you are overshooting the null, not failing.
+- sweep **between one and two fringes**: sinc changes sign, reversing the
+  residual at a given mean phase. A signal dip alone cannot establish that
+  the amplitude has passed the null.
 
 Two practical limits:
 

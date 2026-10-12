@@ -43,6 +43,7 @@ from pol_reconstruction import make_qu_reconstructor
 from polarcam.live.recording_io import read_recording_metadata, recording_fps, recording_phase_marker, strip_phase_marker
 from polarcam.live.intensity_tuning import IntensityDiagnostic, IntensityTuner, display_envelope, roi_channel_means
 from polarcam.live import intensity_spots
+from polarcam.optics import camera_theta_models, theta_from_radius
 from polarcam.live.acquisition_helpers import (preview_u8, capture_path, filename_label, brightness_source, spot_brightness, BRIGHTNESS_EDGES)
 from polarcam.live.background_profiles import read_background_profile, save_active_background
 
@@ -304,29 +305,7 @@ class BasicVideoPlayer:
     LIVE_STATIONARY_CAPTURE_FRAMES = 1640
     LIVE_STATIONARY_CAPTURE_DURATION_S = 1.0
     LIVE_STATIONARY_CAPTURE_ROI_RAW = 14
-    THETA_RECON_LUT_STEP_DEG = 0.1
-    THETA_RECON_MODELS = {
-        "water": {
-            "label": "water finite-NA",
-            "n_medium": 1.333,
-            "na_out": 1.3,
-            "na_hole": 0.39,
-            "J1": 0.8151146019095186,
-            "J2": 0.07979900400468018,
-            "J3": 0.12805600171572504,
-            "r_max": 0.8216609883293448,
-        },
-        "glycerol50": {
-            "label": "50% glycerol finite-NA",
-            "n_medium": 1.398,
-            "na_out": 1.3,
-            "na_hole": 0.39,
-            "J1": 0.7051533822554514,
-            "J2": 0.049316635956229066,
-            "J3": 0.11661874844458937,
-            "r_max": 0.869268135868078,
-        },
-    }
+    THETA_RECON_MODELS = camera_theta_models()
     STATIONARY_DATASET_DIRNAME = "stationary rods 25nm 02072026"
     CAPTURE_DEFAULT_SAVE_DIRNAME = str(Path("datasets") / "attempt240nmsoundonbuffer")
     RECORDINGS_ROOT_DIRNAME = "recordings"
@@ -1542,7 +1521,7 @@ class BasicVideoPlayer:
         # Fetch-frames controls
         self._fetch_busy = False
         self._fetch_sync_lock = False
-        self._camera_exp_ms_var = tk.StringVar(value="0.6")
+        self._camera_exp_ms_var = tk.StringVar(value="1.2")
         self._camera_gain_var = tk.StringVar(value="20")
         self._fetch_exp_ms_var = self._camera_exp_ms_var
         self._fetch_gain_analog_var = self._camera_gain_var
@@ -1739,7 +1718,7 @@ class BasicVideoPlayer:
         self._live_capture_roi_var = tk.StringVar(
             value=f"{int(self.LIVE_STATIONARY_CAPTURE_ROI_RAW)}"
         )
-        self._theta_recon_lut_cache: dict[str, dict[str, np.ndarray | float]] = {}
+        self._theta_recon_lut_cache: dict[str, dict] = {}
         self._live_disp_scale = 1.0
         self._live_disp_offset = (0, 0)
         self._live_zoom_output_px = 240
@@ -1913,7 +1892,6 @@ class BasicVideoPlayer:
         ttk.Combobox(global_bar, textvariable=self._capture_role_var,
                      values=("Sample", "Hinge", "Gold-only control", "BFM", "Background", "Other"),
                      state="readonly", width=16).pack(side=tk.LEFT)
-        ttk.Button(global_bar, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.LEFT, padx=(12, 0))
 
         folder = ttk.Frame(self.root, padding=(8, 0, 8, 4))
         folder.pack(fill=tk.X)
@@ -2023,9 +2001,11 @@ class BasicVideoPlayer:
         trace_controls = ttk.Frame(right)
         trace_controls.pack(fill=tk.X)
         ttk.Label(trace_controls, text="Time trace").pack(side=tk.LEFT)
-        ttk.Combobox(trace_controls, textvariable=self._live_trace_mode_var,
-                     values=("Mean intensity", "X anisotropy", "Y anisotropy"),
-                     state="readonly", width=18).pack(side=tk.LEFT)
+        trace_selector = ttk.Combobox(trace_controls, textvariable=self._live_trace_mode_var,
+                     values=("Mean intensity", "X anisotropy", "Y anisotropy", "X + Y anisotropy"),
+                     state="readonly", width=18)
+        trace_selector.pack(side=tk.LEFT)
+        trace_selector.bind('<<ComboboxSelected>>', lambda event: self._live_render_intensity_plot(force=True))
         roi_controls = ttk.Frame(right)
         roi_controls.pack(fill=tk.X)
         ttk.Label(roi_controls, text="ROI sensor px (even)").pack(side=tk.LEFT)
@@ -2119,7 +2099,6 @@ class BasicVideoPlayer:
         )
         analyser = ttk.LabelFrame(right, text="Live intensity analyser")
         analyser.pack(side=tk.TOP, fill=tk.X, pady=(8, 0))
-        ttk.Button(analyser, text="Interference tuning", command=self._open_intensity_tuning).pack(side=tk.TOP, anchor="w", pady=(0, 4))
         self._live_intensity_start_btn = ttk.Button(
             analyser,
             text="Start analysing magnified region",
@@ -2302,14 +2281,14 @@ class BasicVideoPlayer:
                      state="readonly", width=18).grid(row=0, column=1, sticky="w", padx=6)
         ttk.Label(orientation, text="Frames / average").grid(row=1, column=0, sticky="w", pady=4)
         ttk.Entry(orientation, textvariable=self._intensity_window_var, width=12).grid(row=1, column=1, sticky="w", padx=6)
-        ttk.Label(orientation, text="Theta model (finite-NA)").grid(row=2, column=0, sticky="w")
+        ttk.Label(orientation, text="Medium (Fresnel + hole)").grid(row=2, column=0, sticky="w")
         self._theta_model_combo = ttk.Combobox(
             orientation, textvariable=self._intensity_medium_var,
             values=tuple(self.THETA_RECON_MODELS), state="readonly", width=18,
         )
         self._theta_model_combo.grid(row=2, column=1, sticky="w", padx=6)
         self._theta_model_combo.bind("<<ComboboxSelected>>", lambda _event: self._update_spot_view())
-        ttk.Button(orientation, text="All-rod distribution", command=self._open_intensity_distribution).grid(
+        ttk.Button(orientation, text="Theta / projection", command=self._open_intensity_distribution).grid(
             row=3, column=0, columnspan=2, sticky="w", pady=6)
 
         ttk.Separator(right, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X, pady=(0, 10))
@@ -3253,46 +3232,19 @@ class BasicVideoPlayer:
         return strip_phase_marker(np.asarray(arr), roi_meta=roi_meta)
 
     def _active_theta_medium_key(self) -> str:
-        return "water"
+        variable = getattr(self, "_intensity_medium_var", None)
+        key = variable.get() if variable is not None else "water"
+        return key if key in self.THETA_RECON_MODELS else "water"
 
-    def _theta_recon_lut(self, medium_key: str) -> dict[str, np.ndarray | float]:
+    def _theta_recon_lut(self, medium_key: str) -> dict:
+        # Retain the caller API; reconstruction now uses ABC directly, no LUT.
         key = str(medium_key).strip().lower()
         cached = self._theta_recon_lut_cache.get(key)
         if cached is not None:
             return cached
         model = dict(self.THETA_RECON_MODELS.get(key, self.THETA_RECON_MODELS["water"]))
-        j1 = float(model["J1"])
-        j2 = float(model["J2"])
-        j3 = float(model["J3"])
-        a = j1 - j2
-        b = j1 + j2
-        r_max = float(model["r_max"])
-        step_deg = max(0.01, float(self.THETA_RECON_LUT_STEP_DEG))
-        theta_deg = np.arange(0.0, 90.0, step_deg, dtype=np.float64)
-        theta_deg = np.append(theta_deg, 90.0)
-        theta_rad = np.radians(theta_deg)
-        tan2 = np.tan(theta_rad) ** 2
-        r_vals = np.full(theta_rad.shape, np.nan, dtype=np.float64)
-        finite = np.isfinite(tan2)
-        den = (2.0 * j3) + (b * tan2[finite])
-        ok = np.isfinite(den) & (den > 0.0)
-        r_tmp = np.full(den.shape, np.nan, dtype=np.float64)
-        r_tmp[ok] = (a * tan2[finite][ok]) / den[ok]
-        r_vals[np.where(finite)[0]] = r_tmp
-        if r_vals.size > 0:
-            r_vals[0] = 0.0
-            r_vals[-1] = r_max
-        lut = {
-            "theta_deg": theta_deg,
-            "theta_rad": theta_rad,
-            "r": r_vals,
-            "A": a,
-            "B": b,
-            "J3": j3,
-            "r_max": r_max,
-        }
-        self._theta_recon_lut_cache[key] = lut
-        return lut
+        self._theta_recon_lut_cache[key] = model
+        return model
 
     def _theta_from_cutout_model(self, r_value: float, medium_key: str) -> Optional[float]:
         try:
@@ -3300,12 +3252,7 @@ class BasicVideoPlayer:
             if not np.isfinite(r) or r < 0.0:
                 return None
             lut = self._theta_recon_lut(medium_key)
-            r_vals = np.asarray(lut["r"], dtype=np.float64)
-            theta_rad = np.asarray(lut["theta_rad"], dtype=np.float64)
-            r_max = float(lut["r_max"])
-            if r >= r_max:
-                return 0.5 * np.pi
-            th = float(np.interp(r, r_vals, theta_rad, left=0.0, right=0.5 * np.pi))
+            th = float(theta_from_radius(r, lut["A"], lut["B"], lut["C"]))
             return th if np.isfinite(th) else None
         except Exception:
             return None
@@ -3332,18 +3279,20 @@ class BasicVideoPlayer:
             "theta_other_label": other_label,
             "theta_other_rad": other_th,
             "theta_other_deg": (float(np.degrees(other_th)) if other_th is not None else None),
+            "theta_optical_models": {key: dict(value) for key, value in self.THETA_RECON_MODELS.items()},
+            "theta_invalid_policy": "Nonfinite/negative or above model r_max => no angle",
         }
 
     def _theta_deg_text(self, theta_deg: Optional[float]) -> str:
         try:
             if theta_deg is None:
-                return "90+"
+                return "invalid"
             t = float(theta_deg)
             if not np.isfinite(t):
-                return "90+"
+                return "invalid"
             return f"{t:.1f}"
         except Exception:
-            return "90+"
+            return "invalid"
 
     def _refresh_live_theta_label(self) -> None:
         return
@@ -3634,7 +3583,7 @@ class BasicVideoPlayer:
                 f" | r={r_val:.3f} | phi={phi_deg:.1f} deg{max_px_text}"
             )
         except Exception:
-            return "Theta: 90+ deg (active) | other 90+ deg | r=nan | phi=nan deg"
+            return "Theta: invalid | r=nan | phi=nan deg"
 
     def _stationary_series_full_metrics(self, series: list[tuple[float, float]]) -> dict:
         if not series:
@@ -4119,6 +4068,7 @@ class BasicVideoPlayer:
                             "theta_active_deg": theta_active_deg,
                             "theta_water_deg": theta_water_deg,
                             "theta_glycerol50_deg": theta_glycerol50_deg,
+                            "theta_optical_models": theta_est.get("theta_optical_models"),
                         }
                         self._write_json_atomic(rod_dir / "meta.json", rod_meta)
                         n_ok += 1
@@ -5315,6 +5265,9 @@ class BasicVideoPlayer:
         try:
             with self._live_intensity_lock:
                 data = list(self._live_intensity_buffer)
+            if data and self._live_trace_mode_var.get() == "X + Y anisotropy":
+                self._render_live_xy_traces(data)
+                return
             width, height = 300, 170
             if not data:
                 img = Image.new("RGB", (width, height), "white")
@@ -5389,6 +5342,37 @@ class BasicVideoPlayer:
         except Exception:
             if force:
                 self._live_intensity_status_var.set("Intensity plot unavailable.")
+
+    def _render_live_xy_traces(self, data) -> None:
+        if Figure is None or FigureCanvas is None:
+            self._live_intensity_status_var.set('Matplotlib is required for combined X/Y traces.')
+            return
+        if not hasattr(self,'_live_xy_trace_figure'):
+            fig=Figure(figsize=(3.0,2.8),dpi=100)
+            axes=fig.subplots(2,1,sharex=True)
+            self._live_xy_trace_figure=fig
+            self._live_xy_trace_axes=axes
+            self._live_xy_trace_canvas=FigureCanvas(fig)
+            self._live_xy_trace_lines=[ax.plot([],[],lw=.7,color=color)[0] for ax,color in zip(axes,('#147d99','#bc622c'))]
+            for ax,name in zip(axes,('X','Y')):
+                ax.set_ylabel(name,fontsize=8);ax.tick_params(labelsize=7);ax.grid(alpha=.2)
+            axes[-1].set_xlabel('Time from now (s)',fontsize=7)
+            fig.subplots_adjust(left=.23,right=.96,bottom=.16,top=.94,hspace=.18)
+        times=np.array([p[0] for p in data],float)
+        summaries=[]
+        for j,(ax,line) in enumerate(zip(self._live_xy_trace_axes,self._live_xy_trace_lines)):
+            values=np.array([p[j+2] if len(p)>j+2 else np.nan for p in data],float)
+            valid=np.isfinite(values)
+            line.set_data(*display_envelope(times-times[-1],values,columns=300))
+            ax.set_xlim(-self._live_intensity_window_s,0)
+            if valid.any():
+                lo,hi=float(values[valid].min()),float(values[valid].max())
+                pad=max(.01,.08*(hi-lo));ax.set_ylim(lo-pad,hi+pad)
+                summaries.append(f"{('X','Y')[j]} SD {values[valid].std():.4f}")
+        self._live_xy_trace_canvas.draw()
+        self._live_intensity_plot_ref=ImageTk.PhotoImage(Image.fromarray(np.asarray(self._live_xy_trace_canvas.buffer_rgba()).copy()))
+        self._live_intensity_plot_label.configure(image=self._live_intensity_plot_ref)
+        self._live_intensity_status_var.set(f"{len(data)} native samples · "+' · '.join(summaries))
 
     def _live_capture_stationary_from_magnifier(self) -> None:
         if self._spotrec_running or self._spotrec_proc is not None:
@@ -5529,6 +5513,7 @@ class BasicVideoPlayer:
                     "theta_active_deg": theta_active_deg,
                     "theta_water_deg": theta_water_deg,
                     "theta_glycerol50_deg": theta_glycerol50_deg,
+                    "theta_optical_models": theta_est.get("theta_optical_models"),
                 }
                 self._write_json_atomic(rod_dir / "meta.json", rod_meta)
                 self._ui_call(
@@ -7505,7 +7490,8 @@ class BasicVideoPlayer:
         phi = phi[np.isfinite(phi)]
         if phi.size < 20:
             return None
-        phi = np.unwrap(phi)
+        # A rod's azimuth is pi-periodic; unwrap 2*phi before halving.
+        phi = np.unwrap(2.0 * phi) / 2.0
 
         nphi = int(phi.size)
         max_lag = int(max(5, min(nphi - 1, int(round(0.9 * (nphi - 1))))))
@@ -9046,10 +9032,26 @@ class BasicVideoPlayer:
         if model not in self.THETA_RECON_MODELS:
             raise ValueError("Choose a listed theta model.")
         result = intensity_spots.average_directions(self._intensity_channels, self._theta_recon_lut(model), method, window)
+        # Veto the entire rod if any extraction pixel clipped in any measured frame.
+        # A verified raw peak (or exact BG add-back) is needed to certify the others.
+        clipped = np.zeros(spot_count, dtype=bool)
+        raw_verified = False
+        clipping_source = "Raw clipping evidence unavailable"
+        if self._brightness_peak is not None:
+            peak, full_scale, raw_verified, clipping_source = brightness_source(
+                Path(self.video_path), self._source_recording_metadata,
+                self._brightness_peak, self._brightness_frames)
+            for index, (left, right, top, bottom) in enumerate(self._spot_bounds_int_all):
+                crop = peak[top:bottom, left:right]
+                clipped[index] = bool(crop.size and np.any(crop >= full_scale))
+        result["directions"][:, clipped] = np.nan
+        result["projected"][:, clipped] = np.nan
+        result["spot_clipped"] = clipped
+        result.update(intensity_spots.theta_distribution(result["directions"]))
         density, x_edges, y_edges = intensity_spots.projected_density(result["projected"])
         result.update(density=density, density_x_edges=x_edges, density_y_edges=y_edges)
         metadata = {
-            "schema_version": 1, "source_stack": str(Path(self.video_path).resolve()),
+            "schema_version": 2, "source_stack": str(Path(self.video_path).resolve()),
             "source_metadata": self._source_recording_metadata, "fps": self.source_fps,
             "detector": "DoG on full-stack mean of four-polarizer cell intensity",
             "dog_k": self._dog_k_std, "dog_sigma_small": detect_spinners.DOG_SIGMA_SMALL,
@@ -9062,11 +9064,16 @@ class BasicVideoPlayer:
             "averaging": method, "window_frames": window or frame_count, "partial_last_window": "included",
             "manual_spot_edits": self._manual_spot_edits.get(str(self.video_path), {}),
             "theta_model_key": model, "theta_model": dict(self.THETA_RECON_MODELS[model]),
-            "calibration_status": "Existing theoretical finite-NA model; not validated for this sample",
+            "calibration_status": "Fresnel + BFP + circular hole theory; no APD matrix applied; not sample-validated",
             "orientation_convention": "theta 0..90 deg; continuous doubled-azimuth branch before Cartesian averaging; final phi folded modulo 180 deg",
             "ambiguity": "No unique 3D polarity/tilt-sign recovery; continuity assumes no unresolved azimuth jumps above 90 deg between valid samples",
             "projection": "(nx,ny)/(1+nz), folded upper half disk",
             "density_measure": "Probability per projected-plane area; equal weight per valid rod/window, not solid-angle density",
+            "theta_measure": "5 degree bin counts of the same mean orientations; one per rod with All, otherwise one per rod/window",
+            "theta_solid_angle": "pi*(cos(theta_low)-cos(theta_high)); phi range 0..pi; probability per steradian, geometry only",
+            "clipping_source": clipping_source, "raw_clipping_verified": bool(raw_verified),
+            "excluded_clipped_spots": int(clipped.sum()),
+            "clipping_policy": "Exclude whole spot if any extraction pixel reaches full scale in any measured frame; unverified BG-subtracted data remain provisional",
             "invalid_policy": "Nonfinite/negative channels or nonpositive pair sums excluded; out-of-model reconstructed radii and vanishing Cartesian resultants not projected",
             "valid_averages": int(np.isfinite(result["projected"]).all(axis=-1).sum()),
             "total_averages": int(np.prod(result["projected"].shape[:2])),
@@ -9117,7 +9124,7 @@ class BasicVideoPlayer:
         toolbar = ttk.Frame(popup, padding=8)
         toolbar.pack(fill=tk.X)
         ttk.Button(toolbar, text="Save analysis", command=lambda: self._save_intensity_distribution(result, metadata)).pack(side=tk.LEFT)
-        ttk.Label(toolbar, text=f"{len(self._spot_centers_all)} rods | {metadata['valid_averages']}/{metadata['total_averages']} valid averages | {metadata['averaging']}").pack(side=tk.LEFT, padx=12)
+        ttk.Label(toolbar, text=f"{len(self._spot_centers_all)} detected spots | {metadata['valid_averages']}/{metadata['total_averages']} valid averages | {metadata['averaging']}").pack(side=tk.LEFT, padx=12)
         ttk.Label(popup, text=f"{self.THETA_RECON_MODELS[metadata['theta_model_key']]['label']} | {metadata['window_frames']} frames / average | phi mod 180 deg, +z representative",
                   padding=(8, 0, 8, 4)).pack(anchor="w")
         source = next((entry for entry in self._source_recording_metadata if "conditions" in entry), {})
@@ -9125,6 +9132,36 @@ class BasicVideoPlayer:
         background = source.get("background", {}).get("background_subtracted", "Unknown")
         ttk.Label(popup, text=f"{condition.get('recording_role', 'Unknown recording')} | Interference drive: {condition.get('interference_drive', 'Unknown')} | Saved background subtraction: {background}",
                   padding=(8, 0, 8, 4)).pack(anchor="w")
+        clipping_note = "Raw clipping checked" if metadata["raw_clipping_verified"] else "PROVISIONAL: raw clipping unknown"
+        ttk.Label(popup, text=f"{clipping_note} | {metadata['excluded_clipped_spots']} clipped candidates excluded in full",
+                  padding=(8, 0, 8, 4)).pack(anchor="w")
+        tabs = ttk.Notebook(popup)
+        tabs.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        theta_tab, projection_tab = ttk.Frame(tabs), ttk.Frame(tabs)
+        tabs.add(theta_tab, text="Theta distribution")
+        tabs.add(projection_tab, text="Sphere / projection")
+        unit = "spots" if result["directions"].shape[0] == 1 else "spot/window averages"
+        ttk.Label(theta_tab, text=("One mean orientation per detected spot" if unit == "spots" else
+                  "Multiple windows per rod: these averages are not independent rods") +
+                  " | theta: 0° = optical axis; 90° = coverslip plane",
+                  padding=8).pack(anchor="w")
+        theta_figure = Figure(figsize=(10, 4), dpi=110)
+        count_axis, solid_axis = theta_figure.subplots(1, 2)
+        edges = result["theta_bin_edges_deg"]
+        count_axis.bar(edges[:-1], result["theta_counts"], width=np.diff(edges), align="edge",
+                       color="#167c65", edgecolor="white")
+        count_axis.set(title=f"Theta distribution: {metadata['valid_averages']} {unit}", ylabel=f"Number of {unit}")
+        solid_axis.bar(edges[:-1], result["theta_density_per_sr"], width=np.diff(edges), align="edge",
+                       color="#327da8", edgecolor="white")
+        solid_axis.set(title="Corrected for spherical bin area", ylabel="Probability per steradian")
+        solid_axis.axhline(1/np.pi, color="0.4", ls="--", lw=1, label="Uniform orientations (reference)")
+        solid_axis.legend(fontsize=8)
+        for axis in (count_axis, solid_axis):
+            axis.set(xlabel="Theta (degrees)", xlim=(0, 90), xticks=np.arange(0, 91, 15))
+        theta_figure.tight_layout(pad=1.5)
+        ttk.Label(theta_tab, text="5° bins; no smoothing. Fresnel + BFP + hole model, not sample-validated. Invalid orientations omitted.\n"
+                  "Spherical-area correction does not correct detection bias. Use All for a rod population.",
+                  padding=(8, 0)).pack(anchor="w")
         figure = Figure(figsize=(10, 4.5), dpi=110)
         sphere = figure.add_subplot(131, projection="3d")
         scatter = figure.add_subplot(132)
@@ -9149,17 +9186,20 @@ class BasicVideoPlayer:
             axis.set(xlabel="nx / (1+nz)", ylabel="ny / (1+nz)", xlim=(-1, 1), ylim=(0, 1))
             axis.set_aspect("equal")
         figure.tight_layout(pad=1.5)
-        canvas = FigureCanvas(figure)
-        canvas.draw()
-        original = Image.fromarray(np.asarray(canvas.buffer_rgba()).copy())
-        label = ttk.Label(popup)
-        label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
-        def resize(event):
-            resized = original.copy()
-            resized.thumbnail((max(1, event.width), max(1, event.height)), Image.Resampling.LANCZOS)
-            self._intensity_distribution_image = ImageTk.PhotoImage(resized)
-            label.configure(image=self._intensity_distribution_image)
-        label.bind("<Configure>", resize)
+        def add_plot(parent, plot):
+            canvas = FigureCanvas(plot)
+            canvas.draw()
+            original = Image.fromarray(np.asarray(canvas.buffer_rgba()).copy())
+            label = ttk.Label(parent)
+            label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+            def resize(event):
+                resized = original.copy()
+                resized.thumbnail((max(1, event.width), max(1, event.height)), Image.Resampling.LANCZOS)
+                label.image = ImageTk.PhotoImage(resized)
+                label.configure(image=label.image)
+            label.bind("<Configure>", resize)
+        add_plot(theta_tab, theta_figure)
+        add_plot(projection_tab, figure)
 
     def _analysis_frame(self, frame):
         if self._analysis_detection_mode != "Intensity":

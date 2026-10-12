@@ -8,6 +8,8 @@ assumptions simply to reduce the number of folders.
 - `analysis_2026-10-07_october_consistency`: timing and interference-flag audit.
 - `analysis_2026-10-07_september_oscillation`: September oscillation review.
 - `paper_analysis_20261008`: APD/camera publication-figure trials and local email review.
+- `analysis_2026-10-10_friday`: October/September spot, theta, saturation and
+  interference comparisons; each script retains its stated historical model.
 
 Git contains executable analysis source, notebook inputs and dependencies. Notebook
 outputs are cleared before committing. Executed notebook backups, plots, tables,

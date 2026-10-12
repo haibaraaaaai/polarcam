@@ -170,7 +170,7 @@ class GuiStartupTests(unittest.TestCase):
                                 player._spotrec_exp_ms_var,
                                 player._stationary_capture_max_exp_ms_var,
                             ):
-                                self.assertEqual(float(variable.get()), 0.6)
+                                self.assertEqual(float(variable.get()), 1.2)
                             for variable in (
                                 player._live_background_subtract_var,
                                 player._live_capture_background_subtract_var,
@@ -193,6 +193,19 @@ class GuiStartupTests(unittest.TestCase):
 
 
 class IntensitySpotTests(unittest.TestCase):
+    def test_gui_direct_theta_matches_shared_model_and_records_provenance(self):
+        player = live_gui.BasicVideoPlayer.__new__(live_gui.BasicVideoPlayer)
+        player._theta_recon_lut_cache = {}
+        player._intensity_medium_var = SimpleNamespace(get=lambda: "water")
+        self.assertAlmostEqual(np.degrees(player._theta_from_cutout_model(.39473051184, "water")),
+                               39.15066994496402, places=10)
+        self.assertIsNotNone(player._theta_from_cutout_model(.85, "water"))
+        self.assertIsNone(player._theta_from_cutout_model(.98, "water"))
+        metadata = player._theta_models_from_r(.4)
+        self.assertEqual(metadata["theta_optical_models"]["water"]["model_version"], "annular-fresnel-bfp-v1")
+        player._intensity_medium_var = SimpleNamespace(get=lambda: "glycerol50")
+        self.assertEqual(player._theta_models_from_r(.4)["theta_active_key"], "glycerol50")
+
     def theta_lut(self):
         theta = np.linspace(0, np.pi / 2, 1001)
         return {"r": np.sin(theta)**2, "theta_rad": theta, "r_max": 1.0}
@@ -237,6 +250,22 @@ class IntensitySpotTests(unittest.TestCase):
         np.testing.assert_array_equal(result["valid_counts"][:, 0], [2, 2, 1])
         density, x_edges, y_edges = intensity_spots.projected_density(result["projected"])
         self.assertAlmostEqual(float(np.sum(density*np.diff(x_edges)[:, None]*np.diff(y_edges)[None, :])), 1.0)
+
+    def test_theta_histogram_counts_each_rod_window_and_integrates_to_one(self):
+        angles = np.radians([0, 40, 90])
+        vectors = np.column_stack((np.sin(angles), np.zeros(3), np.cos(angles)))
+        vectors = np.concatenate((vectors, [[np.nan]*3], [[0, 0, 0]]))[None]
+        result = intensity_spots.theta_distribution(vectors)
+        np.testing.assert_allclose(result["theta_deg"][0, :3], [0, 40, 90], atol=1e-10)
+        self.assertTrue(np.isnan(result["theta_deg"][0, 3:]).all())
+        self.assertEqual(result["theta_counts"].sum(), 3)
+        self.assertEqual(result["theta_counts"][-1], 1)
+        self.assertAlmostEqual(float(np.sum(result["theta_density_per_sr"]*result["theta_solid_angle_sr"])), 1.)
+        empty = intensity_spots.theta_distribution(np.full((1, 2, 3), np.nan))
+        self.assertEqual(empty["theta_counts"].sum(), 0)
+        self.assertTrue(np.isfinite(empty["theta_density_per_sr"]).all())
+        repeated = intensity_spots.theta_distribution(np.repeat(vectors, 2, axis=0))
+        self.assertEqual(repeated["theta_counts"].sum(), 6)
 
     def test_detection_map_preserves_native_counts_and_ignores_polarization_split(self):
         first = np.tile(np.array([[100, 700], [300, 900]], dtype=np.uint16), (8, 8))
@@ -427,6 +456,29 @@ class ChannelConventionTests(unittest.TestCase):
         self.angle_app = angle_distribution_analysis.AngleDistributionApp.__new__(
             angle_distribution_analysis.AngleDistributionApp
         )
+
+    def test_direct_phi_preserves_all_four_anisotropy_quadrants(self):
+        model = live_gui.BasicVideoPlayer.THETA_RECON_MODELS['water']
+        for degrees in (15, 60, 105, 150):
+            with self.subTest(phi_degrees=degrees):
+                phi = np.radians(degrees)
+                x, y = 0.3 * np.array([np.cos(2*phi), np.sin(2*phi)])
+                channel = lambda value: np.full((2, 2), value, dtype=float)
+                actual = self.player._xy_phi_stats_from_channel_windows(
+                    a0=channel(100*(1+x)), a90=channel(100*(1-x)),
+                    a45=channel(100*(1+y)), a135=channel(100*(1-y)))
+                self.assertAlmostEqual(actual[2], 0.5*np.arctan2(y, x), places=6)
+                vector = intensity_spots.unit_vectors(np.array([[x, y]]), model)[0]
+                self.assertAlmostEqual(np.arctan2(vector[1], vector[0]), phi, places=6)
+
+    def test_brownian_msd_has_no_false_jump_at_azimuth_wrap(self):
+        continuous = np.radians(np.linspace(80, 100, 80))
+        wrapped = (continuous + np.pi/2) % np.pi - np.pi/2
+        result = self.player._spotrec_brownian_metrics(wrapped.tolist(), 100.0)
+        self.assertIsNotNone(result)
+        lag_frames = np.rint(result['tau'] * 100.0)
+        expected_msd = (lag_frames * (continuous[1]-continuous[0]))**2
+        np.testing.assert_allclose(result['msd'], expected_msd, rtol=1e-10, atol=1e-14)
 
     def test_angle_bounds_agree_with_sensor_and_live(self):
         result = self.angle_app._xy_phi_from_gray_bounds(self.frame, (0, 4, 0, 4))
@@ -628,6 +680,8 @@ class IntensityLifecycleTests(unittest.TestCase):
         with np.load(path, allow_pickle=False) as saved:
             self.assertEqual(saved["channels"].shape, (5, 1, 4))
             self.assertEqual(saved["directions"].shape, (1, 1, 3))
+            self.assertEqual(saved["theta_deg"].shape, (1, 1))
+            self.assertEqual(saved["theta_counts"].sum(), 1)
             exported = json.loads(saved["metadata_json"].item())
             self.assertEqual(exported["source_metadata"][0]["conditions"]["interference_drive"], "On")
             self.assertEqual(exported["averaging"], "3D Cartesian")
@@ -637,6 +691,27 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.root.update_idletasks()
         self.assertIsNotNone(self.player._intensity_distribution_window)
         self.errors.assert_not_called()
+
+    def test_distribution_vetoes_any_raw_clipped_pixel_in_the_whole_rod(self):
+        self.load_intensity_stack()
+        self.player._intensity_window_var.set("1")
+        before, _ = self.player._intensity_distribution_data()
+        self.assertEqual(before["theta_counts"].sum(), 5)
+        left, right, top, bottom = self.player._spot_bounds_int_all[0]
+        self.player._brightness_peak[top, left] = 4095
+        result, metadata = self.player._intensity_distribution_data()
+        self.assertTrue(metadata["raw_clipping_verified"])
+        self.assertEqual(metadata["excluded_clipped_spots"], 1)
+        self.assertEqual(result["theta_counts"].sum(), 0)
+        self.assertTrue(np.isnan(result["projected"]).all())
+        self.assertEqual(self.player._intensity_channels.shape, (5, 1, 4))
+
+    def test_distribution_reports_unverified_legacy_background(self):
+        self.load_intensity_stack()
+        self.player._source_recording_metadata[0]["background"]["background_subtracted"] = True
+        result, metadata = self.player._intensity_distribution_data()
+        self.assertFalse(metadata["raw_clipping_verified"])
+        self.assertEqual(result["theta_counts"].sum(), 1)
 
     def test_theta_plot_matches_per_frame_distribution_for_both_models(self):
         self.load_intensity_stack(blank_frame=True)
@@ -661,7 +736,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.player._intensity_medium_var.set("water")
         figure = live_gui.Figure(figsize=(3.3, 2.0), dpi=100)
         with patch.object(live_gui, "Figure", return_value=figure):
-            self.player._make_theta_plot_image([(0, 0), (.4, 0), (np.nan, 0), (.85, 0)], 10)
+            self.player._make_theta_plot_image([(0, 0), (.4, 0), (np.nan, 0), (.98, 0)], 10)
         theta = figure.axes[0].lines[0].get_ydata()
         self.assertEqual(theta[0], 0)
         self.assertGreater(theta[1], 0)
@@ -837,7 +912,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertIsNot(live, analyser)
         self.assertEqual(self.events[-3:], [(0, "close"), (1, "open"), (1, "start")])
         live.full_sensor.assert_called_once()
-        live.set_timing.assert_called_once_with(10.0, 0.6)
+        live.set_timing.assert_called_once_with(10.0, 1.2)
         self.assertFalse(self.player._live_intensity_running)
         self.assertTrue(self.player._live_running)
         self.assertEqual(self.player._live_zoom_center, (32.0, 32.0))
@@ -1009,6 +1084,17 @@ class IntensityLifecycleTests(unittest.TestCase):
         self.assertIs(self.player._live_intensity_canvas, canvas)
         self.assertEqual(len(self.player._live_intensity_axis.lines), 1)
 
+    def test_combined_live_xy_keeps_native_anisotropy_and_reuses_canvas(self):
+        self.player._live_trace_mode_var.set('X + Y anisotropy')
+        self.player._live_intensity_buffer=deque((i/100,1000,.1+i/1000,-.2-i/2000) for i in range(100))
+        self.player._live_render_intensity_plot(force=True)
+        canvas=self.player._live_xy_trace_canvas
+        self.player._live_render_intensity_plot(force=True)
+        self.assertIs(canvas,self.player._live_xy_trace_canvas)
+        self.assertIn('X SD',self.player._live_intensity_status_var.get())
+        for line,expected in zip(self.player._live_xy_trace_lines,(.199,-.2495)):
+            self.assertAlmostEqual(line.get_ydata()[-1],expected)
+
     def emit_tuning_trial(self, analyser, kind, amplitude, start):
         self.player._intensity_tuning_duration_var.set("6")
         self.player._intensity_tuning_label_var.set(kind)
@@ -1043,7 +1129,7 @@ class IntensityLifecycleTests(unittest.TestCase):
         payload = json.loads(path.read_text())
         self.assertEqual(len(payload["trials"]), 2)
         self.assertEqual(len(payload["trials"][1]["intensity_dn"]), 4800)
-        self.assertEqual(payload["trials"][0]["context"]["exposure_us"], 600.0)
+        self.assertEqual(payload["trials"][0]["context"]["exposure_us"], 1200.0)
 
     def test_settings_change_invalidates_tuning_reference(self):
         analyser = self.start_analyser()

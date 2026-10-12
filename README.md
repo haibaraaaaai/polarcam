@@ -8,7 +8,7 @@ backgrounds, recording modes and saving measurements. It is an editable working
 manual based on Hugh Bowman's 9 September 2026 handover.
 
 **Current status:** camera-free GUI review and synthetic/fake-camera checks passed
-on 11 October 2026. Camera timing, gain readbacks, stage controls and recording
+on 12 October 2026. Camera timing, gain readbacks, stage controls and recording
 transitions still need the lab check. The controls below supersede the older
 session/review descriptions in the working Word manual.
 
@@ -70,7 +70,7 @@ capture type. Existing data are not moved.
 
 ## Recording controls
 
-- Exposure starts at **0.6 ms**, analogue gain at **20**, and magnifier is on.
+- Exposure starts at **1.2 ms**, analogue gain at **20**, and magnifier is on.
   Exposure/gain fields share values across tabs. Use **Apply** to update a running
   live feed; new captures use the current values. Display stretch is separate.
 - Enter a **Filename label** such as `hinge_widefield` before capture. Frame stacks,
@@ -91,8 +91,19 @@ capture type. Existing data are not moved.
   the counts, so inspect the image too.
 - BG-subtracted captures keep one raw maximum-projection image in a `diagnostics/`
   subfolder, referenced and hash-checked through their JSON. Keep it with the
-  recording to recover accurate per-spot clipping counts. Legacy subtracted files
-  without this diagnostic show saved-pixel counts and mark sensor clipping unknown.
+  recording to recover accurate per-spot clipping counts. If it is absent, the
+  program can add back the exact hash-verified integer background, including the
+  sensor ROI offset. Zero-clipped pixels remain upper bounds; unverified or
+  ambiguous backgrounds leave sensor clipping unknown.
+- The live **Time trace** selector offers intensity, X, Y, or **X + Y anisotropy**
+  together. Display reduction preserves extrema; measurements retain native samples.
+- For frame-stack populations, choose **Intensity** detection, then **Theta /
+  projection**. The theta tab shows 5° counts and spherical-area-corrected density;
+  the sphere/projection tab is retained. **Frames / average = All** gives one mean
+  orientation per rod using the selected averaging method and theta model.
+  Any clipped extraction pixel excludes the whole rod from these distributions;
+  legacy files without raw clipping evidence are marked provisional. Save analysis
+  exports the angles, bins, exclusions and settings alongside the original channels.
 - The good/bad/pending review tab and automatic review labels have been removed.
   Old recording folders are retained.
 
@@ -111,6 +122,11 @@ Run this from the repository root. The destination must be inside this checkout'
 local `data/index.csv`. This utility is not part of camera launch.
 
 ## Analysis entry points
+
+[Angle reconstruction](docs/angle_reconstruction.md) documents the camera and
+Polarcam APD paths, hole geometry, Fresnel/BFP coefficients and APD inverse/gain
+conventions. The live GUI now uses their shared direct optical inverse; old
+analysis galleries retain their original models.
 
 Install notebook support in this environment when needed:
 
@@ -156,7 +172,7 @@ Both commands are needed for the current suite:
 ```
 
 The second file contains standalone functions that `unittest` discovery does not
-run. The 11 October camera-free pass covered 115 unittest checks and four metric
+run. The 12 October camera-free pass covered 132 unittest checks and four metric
 checks. Synthetic checks do not establish actual FPS, lost-frame behaviour, stage
 response or experimental accuracy. Remaining historical findings are recorded in
 [the rewrite notes](docs/archive/REWRITE_NOTES.md#other-deferred-findings).
