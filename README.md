@@ -127,6 +127,12 @@ local `data/index.csv`. This utility is not part of camera launch.
 
 ## Analysis entry points
 
+[Framestack quickstart](Framestack_quickstart.ipynb) is the small camera-analysis
+notebook: choose a stack and its matching minimum background, inspect detections
+and raw saturation, then plot per-spot r/θ statistics from one exposure. The
+JSON/raw-peak companions are used automatically when present. Without JSON,
+explicitly set whether the saved stack is already background-subtracted.
+
 [Angle reconstruction](docs/angle_reconstruction.md) documents the camera and
 Polarcam APD paths, hole geometry, Fresnel/BFP coefficients and APD inverse/gain
 conventions. The live GUI now uses their shared direct optical inverse; old
@@ -136,7 +142,7 @@ Install notebook support in this environment when needed:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -e ".[analysis]"
-.\.venv\Scripts\python.exe -m jupyterlab analysis
+.\.venv\Scripts\python.exe -m jupyterlab Framestack_quickstart.ipynb
 ```
 
 The maintained paper trials are in `analysis/paper_analysis_20261008/`:

@@ -7,5 +7,5 @@
     "bfm_camera": "bfm/polarcam",
     "bfm_apd": "bfm/apd_polarcam"
   },
-  "note": "Paths relative to data/. Camera recordings are grouped by acquisition date. Local index.csv contains file labels and provenance; raw sidecars are unchanged."
+  "note": "Paths relative to data/. Camera recordings are grouped by acquisition date. Local index.csv contains historical labels and provenance. Sidecar review fields contain later clarifications; original acquisition values and notes are preserved."
 }
